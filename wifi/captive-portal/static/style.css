@@ -1,0 +1,127 @@
+body {
+  font-family: "Inter", "Helvetica Neue", sans-serif;
+  background-color: #000;
+  color: #d4f5df;
+  text-align: center;
+  margin: 0;
+  height: 100vh;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+
+.container {
+  background-color: #0d0d0d;
+  padding: 60px;
+  border-radius: 24px;
+  box-shadow: 0 0 40px rgba(0, 255, 128, 0.1);
+  width: 360px;
+
+}
+
+.logo img {
+  width: 200px;
+  filter: brightness(0) saturate(100%) invert(60%) sepia(30%) saturate(400%) hue-rotate(100deg);
+}
+.logo h1 {
+  color: #5bf582;
+  font-weight: 600;
+  letter-spacing: 2px;
+  margin-top: 10px;
+  font-size: 1.3em;
+}
+
+.description {
+  font-size: 0.9em;
+  color: #b3b3b3;
+  margin: 20px 0 30px 0;
+}
+
+.wifi-form input {
+  display: block;
+  width: 93%;
+  margin-bottom: 15px;
+  padding: 12px;
+  border: 1px solid #2b2b2b;
+  border-radius: 12px;
+  background-color: #121212;
+  color: #d4f5df;
+  font-size: 1em;
+  outline: none;
+  transition: border-color 0.2s;
+}
+
+.wifi-form input:focus {
+  border-color: #bee8c8;
+}
+
+
+.connect-button {
+  width: 100%;
+  padding: 12px;
+  border: none;
+  border-radius: 12px;
+  background: linear-gradient(135deg, #59bb71 0%, #4bd07a 80%, #2ed1a2 100%);
+  color: #081907;
+  font-family: "Inter", "Helvetica Neue", sans-serif;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+  /* transition: transform 0.12s ease-in-out, box-shadow 0.12s ease-in-out; */
+  box-shadow: 0 6px 18px rgba(91,245,130,0.08), 0 0 8px rgba(91,245,130,0.08) inset;
+}
+
+.connect-button:hover {
+  
+  transform: scale(1.03);
+  filter: brightness(110%); 
+  box-shadow: #5bf582 0px 0px 5px;
+  /* background-color: #62c579; */
+}
+
+
+.password-wrapper {
+  position: relative;
+  display: block;
+    width: 93%;
+  /* width: 100%; */
+  margin-bottom: 15px;
+}
+
+.password-wrapper input {
+  width: 100%;
+  /* padding-right: 40px; space for the eye button */
+}
+
+
+.toggle-password {
+  width: 30px;
+  height: 30px;
+  position: absolute;
+  left: 93%;
+  top: 25%;
+  transform: translateY(-50%);
+  border: none;
+  background: none;
+  color: #d4f5df;
+  font-size: 1.2em;
+  cursor: pointer;
+  outline: none;
+}
+
+.look-button {
+  position: absolute; 
+  left: 10px;
+  font-size: 1em;
+  filter: invert(65%) sepia(20%) saturate(500%) hue-rotate(100deg);
+  top: 12px; 
+   width: 23px;
+  height: 27px;
+}
+
+.look-button:hover {
+  filter: brightness(30) saturate(100%) invert(85%) sepia(30%) saturate(600%) hue-rotate(100deg);
+}
+

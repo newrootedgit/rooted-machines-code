@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Rooted Robotics | Wi-Fi Setup</title>
+  <link rel="stylesheet" href="../static/style.css">
+</head>
+<body>
+  <div class="container">
+    <div class="logo">
+      <img src="../static/img/rooted.avif" alt="logo" />
+    </div>
+    <p class="description">
+      Connect your Rooted Robotics device to your Wi-Fi network to begin setup.
+    </p>
+
+    <form action="/connect" method="POST" class="wifi-form" id="wifi-form">
+      <input type="text" name="ssid" placeholder="Wi-Fi Name (SSID)" required>
+
+      <div class="password-wrapper">
+        <input type="password" name="password" placeholder="Wi-Fi Password" required id="password">
+        <button type="button" class="toggle-password" onclick="togglePassword()" aria-pressed="false" aria-label="Toggle password visibility">
+          <img id="toggle-img" src="../static/img/closed-eyes.png" alt="Show password" class="look-button">
+        </button>
+      </div>
+
+      <button type="submit" class="connect-button">CONNECT</button>
+    </form>
+
+    <div id="status-message" class="status-message" style="display: none;">
+      <h3>Your machine is connecting to the internet.</h3>
+      <p>If the hotspot reappears, connection failed. Please try again with corrected username and password. 
+      If you continue to have issues, please contact support at <a href="mailto:support@rootedrobotics.com">support@rootedrobotics.com</a>.</p>
+    </div>
+
+    <script>
+      function togglePassword() {
+        const passwordInput = document.getElementById('password');
+        const toggleButton = document.querySelector('.toggle-password');
+        const toggleImg = document.getElementById('toggle-img');
+        const isPressed = toggleButton.getAttribute('aria-pressed') === 'true';
+
+        if (isPressed) {
+          passwordInput.type = 'password';
+          toggleButton.setAttribute('aria-pressed', 'false');
+          toggleImg.src = '../static/img/closed-eyes.png';
+          toggleImg.alt = 'Show password';
+        } else {
+          passwordInput.type = 'text';
+          toggleButton.setAttribute('aria-pressed', 'true');
+          toggleImg.src = '../static/img/eyeball-icon-png-eye-icon-1.png';
+          toggleImg.alt = 'Hide password';
+        }
+      }
+
+      document.getElementById('wifi-form').addEventListener('submit', function() {
+        document.getElementById('status-message').style.display = 'block';
+        document.querySelector('.wifi-form').style.display = 'none';
+        document.querySelector('.description').style.display = 'none';
+      });
+    </script>
+  </div>
+</body>
+</html>
