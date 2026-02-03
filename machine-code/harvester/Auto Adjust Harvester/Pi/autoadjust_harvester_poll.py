@@ -657,7 +657,7 @@ def monitor_touch_encoder_loop():
         # Screen 9: Save Preset
         # -----------------------------
         if active_screen == ScreenID(9):
-            variety_index = get_variable(10, 1)     # current variety selection
+            variety_index = get_variable(26, 1)     # current variety selection (Edit Mode screen)
             blade_speed = get_variable(6, 1)       # blade speed
             belt_speed = get_variable(3, 1)         # belt speed
             blade_height = get_variable(16, 1)     # blade height
