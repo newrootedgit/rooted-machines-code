@@ -1,6 +1,24 @@
 {
     "ready_to_run": false,
     "active_variety": 1,
+    "variable_ranges": {
+        "blade_speed": {
+            "min": 0,
+            "max": 3
+        },
+        "belt_speed": {
+            "min": 0,
+            "max": 20
+        },
+        "blade_height": {
+            "min": 0,
+            "max": 250
+        },
+        "airknife_mode": {
+            "min": 0,
+            "max": 3
+        }
+    },
     "variety_names": {
         "1": "Broccoli",
         "2": "Arugula",
