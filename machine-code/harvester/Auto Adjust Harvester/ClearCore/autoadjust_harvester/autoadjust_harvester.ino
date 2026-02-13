@@ -16,6 +16,17 @@
 
 #define KillSwitchPin DI6  // Blade Soft Kill Switch
 
+// Solenoid outputs (ClearCore IO connectors)
+#define TopSolenoid ConnectorIO2
+#define BotSolenoid ConnectorIO1
+
+// Solenoid timing configuration
+#define BOT_SOLENOID_DURATION_MS 500   // Bottom solenoid on duration
+#define FIRST_PULSE_DELAY_MS 1000      // Delay after bottom off before first top pulse
+#define FIRST_PULSE_DURATION_MS 250    // First top pulse duration
+#define SECOND_PULSE_DELAY_MS 250      // Delay after tray clears before second top pulse
+#define SECOND_PULSE_DURATION_MS 500   // Second top pulse duration
+
 #define INPUT_A_B_FILTER 20
 
 #define baudRate 9600
@@ -65,6 +76,20 @@ bool lastKillSwitchState = false;  // Track kill switch state changes
 
 // Belt speed scaling factor (converts beltSpeed value to pulses/sec)
 #define BELT_SPEED_SCALE 600  // Adjust this to tune belt speed
+
+// Tray detection and solenoid state machine
+enum TrayState {
+    TRAY_IDLE,              // Waiting for tray detection
+    TRAY_BOT_SOLENOID,      // Bot solenoid is on (for 500ms)
+    TRAY_WAIT_FIRST_PULSE,  // Waiting 1s after bottom off before first top pulse
+    TRAY_FIRST_TOP_PULSE,   // First top pulse (250ms)
+    TRAY_WAIT_TRAY_CLEAR,   // Waiting for tray to clear
+    TRAY_WAIT_SECOND_PULSE, // Waiting 500ms after tray clears before second pulse
+    TRAY_SECOND_TOP_PULSE   // Second top pulse (500ms)
+};
+TrayState trayState = TRAY_IDLE;
+unsigned long trayStateStartTime = 0;
+bool lastTrayDetected = false;          // Track tray state for edge detection
 
 // Interrupt flags for limit switches
 volatile bool lowerLimitHit = false;
@@ -117,10 +142,17 @@ void setup() {
     pinMode(TrayDetectionPin, INPUT);
     pinMode(KillSwitchPin, INPUT);
 
+    // Configure solenoid outputs (ClearCore IO connectors)
+    TopSolenoid.Mode(Connector::OUTPUT_DIGITAL);
+    BotSolenoid.Mode(Connector::OUTPUT_DIGITAL);
+    TopSolenoid.State(false);
+    BotSolenoid.State(false);
+
     Serial.begin(baudRate);
     delay(2000); // Give time for Serial to initialize
 
     Serial.println("=== ClearCore Starting ===");
+    Serial.println("Solenoids configured (IO1=Top, IO2=Bot)");
 
     // Attach interrupts for limit switches (RISING = LOW -> HIGH transition)
     // attachInterrupt(digitalPinToInterrupt(LowerLimitPin), OnLowerLimitHit, RISING);
@@ -281,6 +313,109 @@ void loop() {
         lastKillSwitchState = killSwitchActive;
     }
 
+    // Tray detection and solenoid control state machine
+    // airKnifeMode: 0=Off, 1=Bottom only, 2=Top only, 3=Both (full sequence)
+    // Sequence: tray -> bot on 500ms -> wait 1s -> top pulse 250ms -> wait for tray clear -> wait 500ms -> top pulse 500ms
+    bool trayDetected = digitalRead(TrayDetectionPin);
+
+    // State machine for solenoid control
+    switch (trayState) {
+        case TRAY_IDLE:
+            // Waiting for tray to be detected
+            if (trayDetected && !lastTrayDetected && airKnifeMode > 0) {
+                Serial.print("Tray switch: ACTIVE - airknife mode ");
+                Serial.println(airKnifeMode);
+
+                if (airKnifeMode == 1 || airKnifeMode == 3) {
+                    // Mode 1 or 3: Start with bottom solenoid on
+                    BotSolenoid.State(true);
+                    trayStateStartTime = millis();
+                    trayState = TRAY_BOT_SOLENOID;
+                    Serial.println("  -> Bottom solenoid ON");
+                } else if (airKnifeMode == 2) {
+                    // Mode 2: Skip bottom, wait 1s then first top pulse
+                    trayStateStartTime = millis();
+                    trayState = TRAY_WAIT_FIRST_PULSE;
+                    Serial.println("  -> Waiting 1s for first top pulse");
+                }
+            }
+            break;
+
+        case TRAY_BOT_SOLENOID:
+            // Bottom solenoid is on for 500ms
+            if (millis() - trayStateStartTime >= BOT_SOLENOID_DURATION_MS) {
+                BotSolenoid.State(false);
+                Serial.println("  -> Bottom solenoid OFF");
+
+                if (airKnifeMode == 1) {
+                    // Mode 1: Only bottom, wait for tray to clear then done
+                    trayState = TRAY_WAIT_TRAY_CLEAR;
+                    Serial.println("  -> Waiting for tray to clear");
+                } else if (airKnifeMode == 3) {
+                    // Mode 3: Wait 1s before first top pulse
+                    trayStateStartTime = millis();
+                    trayState = TRAY_WAIT_FIRST_PULSE;
+                    Serial.println("  -> Waiting 1s for first top pulse");
+                }
+            }
+            break;
+
+        case TRAY_WAIT_FIRST_PULSE:
+            // Waiting 1 second after bottom off before first top pulse
+            if (millis() - trayStateStartTime >= FIRST_PULSE_DELAY_MS) {
+                TopSolenoid.State(true);
+                trayStateStartTime = millis();
+                trayState = TRAY_FIRST_TOP_PULSE;
+                Serial.println("  -> First top pulse ON (250ms)");
+            }
+            break;
+
+        case TRAY_FIRST_TOP_PULSE:
+            // First top pulse for 250ms
+            if (millis() - trayStateStartTime >= FIRST_PULSE_DURATION_MS) {
+                TopSolenoid.State(false);
+                trayState = TRAY_WAIT_TRAY_CLEAR;
+                Serial.println("  -> First top pulse OFF, waiting for tray to clear");
+            }
+            break;
+
+        case TRAY_WAIT_TRAY_CLEAR:
+            // Waiting for tray to clear
+            if (!trayDetected && lastTrayDetected) {
+                trayStateStartTime = millis();
+                if (airKnifeMode == 1) {
+                    // Mode 1: Bottom only, sequence complete
+                    trayState = TRAY_IDLE;
+                    Serial.println("  -> Tray cleared, sequence complete");
+                } else {
+                    // Mode 2 or 3: Wait 500ms then second top pulse
+                    trayState = TRAY_WAIT_SECOND_PULSE;
+                    Serial.println("  -> Tray cleared, waiting 500ms for second pulse");
+                }
+            }
+            break;
+
+        case TRAY_WAIT_SECOND_PULSE:
+            // Waiting 500ms after tray clears before second pulse
+            if (millis() - trayStateStartTime >= SECOND_PULSE_DELAY_MS) {
+                TopSolenoid.State(true);
+                trayStateStartTime = millis();
+                trayState = TRAY_SECOND_TOP_PULSE;
+                Serial.println("  -> Second top pulse ON (500ms)");
+            }
+            break;
+
+        case TRAY_SECOND_TOP_PULSE:
+            // Second top pulse for 500ms
+            if (millis() - trayStateStartTime >= SECOND_PULSE_DURATION_MS) {
+                TopSolenoid.State(false);
+                trayState = TRAY_IDLE;
+                Serial.println("  -> Second top pulse OFF, sequence complete");
+            }
+            break;
+    }
+    lastTrayDetected = trayDetected;
+
     // Auto-poll TCP server at regular intervals
     if (millis() - lastTcpPollTime >= TCP_POLL_INTERVAL_MS) {
         lastTcpPollTime = millis();
@@ -421,89 +556,7 @@ void loop() {
             LinearRailMoveAbsolute(targetPositionSteps);
         }
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    // if (client.available() > 0) {
-    //     int len = client.read(packetReceived, MAX_PACKET_LENGTH - 1);
-    //     packetReceived[len] = '\0';
-
-    //     // Print the received message
-    //     Serial.print("Received message: ");
-    //     Serial.println((char *)packetReceived);
-
-    //     // Initialize variables to hold parsed values
-    //     int screen5Var1Value = 1; // initialize value to 2 which corresponds to the blade being off. 1->clean, 2->off, 3->low, 4->high
-    //     int screen3Var1Value = 0;
-
-    //     // Find and extract values for screen_5_var_1 and screen_3_var_1
-    //     char* screen5Ptr = strstr((char*)packetReceived, "screen_5_var_1: ");
-    //     char* screen3Ptr = strstr((char*)packetReceived, "screen_3_var_1: ");
-        
-    //     if (screen5Ptr != NULL) {
-    //         screen5Var1Value = atoi(screen5Ptr + strlen("screen_5_var_1: "));
-    //     }
-        
-    //     if (screen3Ptr != NULL) {
-    //         screen3Var1Value = atoi(screen3Ptr + strlen("screen_3_var_1: "));
-    //     }
-
-    //     // Debug output to verify values
-    //     Serial.print("Parsed Screen 5 Var 1 Value: ");
-    //     Serial.println(screen5Var1Value);
-    //     Serial.print("Parsed Screen 3 Var 1 Value: ");
-    //     Serial.println(screen3Var1Value);
-
-    //     // Calculate blade speed and belt speed based on parsed values
-    //     int blade_speed = screen5Var1Value;
-    //     int belt_speed = -150 * 5 * screen3Var1Value; // scaled to menu displayin 0-20
-    //     int belt_delay = abs(65000000 / belt_speed);
-
-    //     if (KillSwitchStatus){ //check soft kill switch state
-    //       // // Execute functions with calculated speeds
-    //       // RampToVelocitySelection(blade_speed);
-    //       // MoveAtVelocity(belt_speed);
-    //     }
-    //     if (!KillSwitchStatus){ //check soft kill switch state
-    //       // // Execute functions with calculated speeds
-    //       // RampToVelocitySelection(1);
-    //       // MoveAtVelocity(0);
-    //     }
-    //     // Optional delay for belt movement
-    //     delay(100);
-        
-    // }
-    //  else {
-    //     // Serial.println("Server disconnected. Reconnecting...");
-    //     client.connect(serverIp, PORT_NUM);
-    //     delay(500);
-
-    // }        
+   
 
 }
 
@@ -838,21 +891,24 @@ bool ReadFromTCPServer() {
             token = strtok(NULL, ",");
             if (token != NULL) airKnifeMode = atoi(token);
 
-            // Print labeled values
-            Serial.print("TCP: ready=");
-            Serial.print(readyToRun);
-            Serial.print(" variety=");
-            Serial.print(activeVariety);
-            Serial.print(" blade=");
-            Serial.print(bladeSpeed);
-            Serial.print(" belt=");
-            Serial.print(beltSpeed);
-            Serial.print(" height=");
-            Serial.print(bladeHeight);
-            Serial.print(" airknife=");
-            Serial.print(airKnifeMode);
-            Serial.print(" motors=");
-            Serial.println(digitalRead(KillSwitchPin) ? "ENABLED" : "DISABLED");
+            Serial.print("TCP: airKnifeMode = ");
+            Serial.println(airKnifeMode);
+
+            // Print labeled values (COMMENTED OUT FOR TESTING)
+            // Serial.print("TCP: ready=");
+            // Serial.print(readyToRun);
+            // Serial.print(" variety=");
+            // Serial.print(activeVariety);
+            // Serial.print(" blade=");
+            // Serial.print(bladeSpeed);
+            // Serial.print(" belt=");
+            // Serial.print(beltSpeed);
+            // Serial.print(" height=");
+            // Serial.print(bladeHeight);
+            // Serial.print(" airknife=");
+            // Serial.print(airKnifeMode);
+            // Serial.print(" motors=");
+            // Serial.println(digitalRead(KillSwitchPin) ? "ENABLED" : "DISABLED");
 
             client.stop();
             return true;

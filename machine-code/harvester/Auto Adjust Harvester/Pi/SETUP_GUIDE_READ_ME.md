@@ -162,9 +162,9 @@ Create systemd services for autorun + auto-restart (REPLACES crontab)
 ----------------------------------------
 Copy and paste this entire block to create both services and start them:
 ```bash
-sudo tee /etc/systemd/system/autoadjust_harvester_poll.service >/dev/null <<'EOF'
+sudo tee /etc/systemd/system/harvester_poll.service >/dev/null <<'EOF'
 [Unit]
-Description=Autoadjust Harvester Poll
+Description=Harvester Poll
 After=network-online.target
 Wants=network-online.target
 [Service]
@@ -179,9 +179,9 @@ NoNewPrivileges=true
 WantedBy=multi-user.target
 EOF
 
-sudo tee /etc/systemd/system/autoadjust_harvester_tcp_server.service >/dev/null <<'EOF'
+sudo tee /etc/systemd/system/harvester_tcp_server.service >/dev/null <<'EOF'
 [Unit]
-Description=Autoadjust Harvester TCP Server
+Description=Harvester TCP Server
 After=network-online.target
 Wants=network-online.target
 [Service]
@@ -197,18 +197,18 @@ WantedBy=multi-user.target
 EOF
 
 sudo systemctl daemon-reload
-sudo systemctl enable autoadjust_harvester_poll.service
-sudo systemctl enable autoadjust_harvester_tcp_server.service
-sudo systemctl start autoadjust_harvester_poll.service
-sudo systemctl start autoadjust_harvester_tcp_server.service
+sudo systemctl enable harvester_poll.service
+sudo systemctl enable harvester_tcp_server.service
+sudo systemctl start harvester_poll.service
+sudo systemctl start harvester_tcp_server.service
 ```
 
 ----------------------------------------
 Verify services and function
 ----------------------------------------
 ```bash
-sudo systemctl is-active autoadjust_harvester_poll.service
-sudo systemctl is-active autoadjust_harvester_tcp_server.service
+sudo systemctl is-active harvester_poll.service
+sudo systemctl is-active harvester_tcp_server.service
 ```
 
 # JSON updates (size or mtime should change while turning the encoder)
@@ -228,25 +228,25 @@ Troubleshooting
 1) TCP bind error on 192.168.10.1:
 ```bash
 # Edit autoadjust_harvester_tcp_server.py and set HOST = "0.0.0.0"
-sudo systemctl restart autoadjust_harvester_tcp_server.service
+sudo systemctl restart harvester_tcp_server.service
 ```
 
 2) Poller permission issues / no touch encoders found:
 ```bash
 # Temporary: run poller as root
-sudo sed -i 's/^User=rooted/User=root/' /etc/systemd/system/autoadjust_harvester_poll.service
+sudo sed -i 's/^User=rooted/User=root/' /etc/systemd/system/harvester_poll.service
 sudo systemctl daemon-reload
-sudo systemctl restart autoadjust_harvester_poll.service
+sudo systemctl restart harvester_poll.service
 
 # Proper: fix udev rule (see above), then switch back to User=rooted
-sudo sed -i 's/^User=root$/User=rooted/' /etc/systemd/system/autoadjust_harvester_poll.service
+sudo sed -i 's/^User=root$/User=rooted/' /etc/systemd/system/harvester_poll.service
 sudo systemctl daemon-reload
-sudo systemctl restart autoadjust_harvester_poll.service
+sudo systemctl restart harvester_poll.service
 ```
 
 3) Minimal logs:
 ```bash
-sudo journalctl -u autoadjust_harvester_poll.service -n 50 --no-pager
-sudo journalctl -u autoadjust_harvester_tcp_server.service -n 50 --no-pager
+sudo journalctl -u harvester_poll.service -n 50 --no-pager
+sudo journalctl -u harvester_tcp_server.service -n 50 --no-pager
 ```
 
