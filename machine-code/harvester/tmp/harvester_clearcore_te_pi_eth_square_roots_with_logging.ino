@@ -75,6 +75,7 @@ struct TelemetryState {
   uint32_t udpSendFailCount; 
   bool lastBeltFault; 
   bool lastBladeFault; 
+  bool lastKillSwitchState;
 };
 
 TelemetryState t;
@@ -166,6 +167,7 @@ void setup() {
     t.udpSendFailCount = 0;
     t.lastBeltFault = false;
     t.lastBladeFault = false;
+    t.lastKillSwitchState = digitalRead(inputPin1);
 
     Udp.begin(UDP_LOCAL_PORT); // If connection doesn't work, ignore
 }
@@ -175,6 +177,11 @@ void loop() {
     uint32_t currentTime = millis();
     bool beltFault = BeltMotor.StatusReg().bit.AlertsPresent;
     bool bladeFault = BladeMotor.StatusReg().bit.MotorInFault;
+
+    if (inputState1 != t.lastKillSwitchState) {
+        SendEvent("KILL_SWITCH_CHANGED", inputState1 ? 1 : 0);
+        t.lastKillSwitchState = inputState1;
+    }
 
     if (beltFault != t.lastBeltFault) {
         if (beltFault) {
@@ -425,31 +432,30 @@ static int16_t ReadTorquePctOrUnknown() {
     return -1; // unknown / not configured
 }
 
-static int32_t EncodeEventAsDelta(const char *eventCode, int32_t value) {
-    uint16_t eventId = 999;
-    if (strcmp(eventCode, "FAULT_BELT_RAISED") == 0) {
-        eventId = 101;
-    } else if (strcmp(eventCode, "FAULT_BELT_CLEARED") == 0) {
-        eventId = 102;
-    } else if (strcmp(eventCode, "FAULT_BLADE_RAISED") == 0) {
-        eventId = 201;
-    } else if (strcmp(eventCode, "FAULT_BLADE_CLEARED") == 0) {
-        eventId = 202;
-    }
-
-    int32_t valueMag = value < 0 ? -value : value;
-    valueMag = valueMag % 1000;
-    return -((int32_t)eventId * 1000 + valueMag);
-}
-
 void SendEvent(const char *eventCode, int32_t value) {
-    char telemetryBuffer[64];
-    uint32_t uptimeS = millis() / 1000;
-    int32_t encodedDelta = EncodeEventAsDelta(eventCode, value);
+    char telemetryBuffer[192];
+    uint32_t uptimeMs = millis();
+    bool beltFault = BeltMotor.StatusReg().bit.AlertsPresent;
+    bool bladeFault = BladeMotor.StatusReg().bit.MotorInFault;
+    uint16_t alertBits = EncodeBeltAlerts();
+    int killSwitch = digitalRead(inputPin1) ? 1 : 0;
+    uint32_t cmdAgeMs = uptimeMs - t.lastRxCmdMs;
+    uint32_t seq = ++t.seq;
 
-    // Logger currently only accepts: LOG|<UptimeS>|<DeltaSteps>.
-    snprintf(telemetryBuffer, sizeof(telemetryBuffer), "LOG|%lu|%ld",
-             (unsigned long)uptimeS, (long)encodedDelta);
+    // EVENT,1,boot_id,seq,uptime_ms,event_code,value,belt_fault,blade_fault,alert_bits,kill_switch,cmd_age_ms,udp_fail
+    snprintf(telemetryBuffer, sizeof(telemetryBuffer),
+             "EVENT,1,%lu,%lu,%lu,%s,%ld,%d,%d,%u,%d,%lu,%lu",
+             (unsigned long)t.bootId,
+             (unsigned long)seq,
+             (unsigned long)uptimeMs,
+             eventCode,
+             (long)value,
+             beltFault ? 1 : 0,
+             bladeFault ? 1 : 0,
+             (unsigned int)alertBits,
+             killSwitch,
+             (unsigned long)cmdAgeMs,
+             (unsigned long)t.udpSendFailCount);
 
     Udp.beginPacket(serverIp, remotePort);
     Udp.write((const uint8_t *)telemetryBuffer, strlen(telemetryBuffer));
@@ -459,9 +465,17 @@ void SendEvent(const char *eventCode, int32_t value) {
 }
 
 void SendStatusUpdate() {
-    char telemetryBuffer[64];
-    int32_t currentPosition = BeltMotor.Position();
+    char telemetryBuffer[192];
+    int32_t currentPosition = BeltMotor.PositionRefCommanded();
     int32_t deltaSteps = 0;
+    uint32_t uptimeMs = millis();
+    bool beltFault = BeltMotor.StatusReg().bit.AlertsPresent;
+    bool bladeFault = BladeMotor.StatusReg().bit.MotorInFault;
+    uint16_t alertBits = EncodeBeltAlerts();
+    int16_t torquePct = ReadTorquePctOrUnknown();
+    int killSwitch = digitalRead(inputPin1) ? 1 : 0;
+    uint32_t cmdAgeMs = uptimeMs - t.lastRxCmdMs;
+    uint32_t seq = ++t.seq;
 
     if (!telemetryPositionInitialized) {
         lastTelemetryPosition = currentPosition;
@@ -471,9 +485,20 @@ void SendStatusUpdate() {
         lastTelemetryPosition = currentPosition;
     }
 
-    // Logger currently expects this exact pipe-delimited frame.
-    snprintf(telemetryBuffer, sizeof(telemetryBuffer), "LOG|%lu|%ld",
-             (unsigned long)(millis() / 1000), (long)deltaSteps);
+    // STATUS_UPDATE,1,boot_id,seq,uptime_ms,delta_steps,torque_pct,belt_fault,blade_fault,alert_bits,kill_switch,cmd_age_ms,udp_fail
+    snprintf(telemetryBuffer, sizeof(telemetryBuffer),
+             "STATUS_UPDATE,1,%lu,%lu,%lu,%ld,%d,%d,%d,%u,%d,%lu,%lu",
+             (unsigned long)t.bootId,
+             (unsigned long)seq,
+             (unsigned long)uptimeMs,
+             (long)deltaSteps,
+             (int)torquePct,
+             beltFault ? 1 : 0,
+             bladeFault ? 1 : 0,
+             (unsigned int)alertBits,
+             killSwitch,
+             (unsigned long)cmdAgeMs,
+             (unsigned long)t.udpSendFailCount);
 
     Udp.beginPacket(serverIp, remotePort);
     Udp.write((const uint8_t *)telemetryBuffer, strlen(telemetryBuffer));
