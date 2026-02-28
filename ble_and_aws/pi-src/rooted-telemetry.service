@@ -1,0 +1,26 @@
+[Unit]
+Description=Rooted Robotics Telemetry Uplink
+Documentation=https://github.com/rooted-robotics
+After=network-online.target rooted-iot.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rooted
+Group=rooted
+WorkingDirectory=/opt/rooted-ble
+ExecStart=/opt/rooted-ble/.venv/bin/python3 -u /opt/rooted-ble/aws/telemetry.py
+Restart=always
+RestartSec=30
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=false
+ReadWritePaths=/opt/rooted-ble /home/rooted/te-cli
+
+[Install]
+WantedBy=multi-user.target

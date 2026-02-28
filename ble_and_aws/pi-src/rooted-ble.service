@@ -1,0 +1,24 @@
+[Unit]
+Description=Rooted Robotics BLE Provisioner
+Documentation=https://github.com/rooted-robotics
+After=bluetooth.target
+Wants=bluetooth.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/rooted-ble
+ExecStartPre=/usr/bin/bluetoothctl power on
+ExecStart=/opt/rooted-ble/.venv/bin/python3 -u /opt/rooted-ble/provisioner.py
+Restart=always
+RestartSec=10
+
+# Bluetooth requires elevated permissions
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,13 @@
+[Unit]
+Description=Run BLE provisioner for 5 minutes after boot
+Documentation=https://github.com/rooted-robotics
+
+[Timer]
+# Start 10 seconds after boot (give Bluetooth time to initialize)
+OnBootSec=10sec
+
+# Don't persist across reboots
+Persistent=false
+
+[Install]
+WantedBy=timers.target
