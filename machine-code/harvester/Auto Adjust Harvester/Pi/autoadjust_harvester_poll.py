@@ -93,6 +93,12 @@ def ensure_json_exists(path: str):
                     json.dump({
                         "ready_to_run": False,
                         "active_variety": None,
+                        "variable_ranges": {
+                            "blade_speed": {"min": 0, "max": 3},
+                            "belt_speed": {"min": 0, "max": 20},
+                            "blade_height": {"min": 0, "max": 250},
+                            "airknife_mode": {"min": 0, "max": 3},
+                        },
                         "variety_names": default_names,
                     }, f, indent=4)
 
@@ -446,6 +452,9 @@ def verify_pin(entered_pin: list) -> bool:
             # Pause before advancing to result screen
             time.sleep(2)
             if pin_matches:
+                # Write variety name before navigating to screen 26
+                # to prevent flash of default string
+                write_variety_to_screen(1, EDIT_VARIETY_SCREEN, EDIT_VARIETY_VAR)
                 te.guide.set_screen(ScreenID(26))
             else:
                 te.guide.set_screen(ScreenID(37))
@@ -578,9 +587,12 @@ def monitor_touch_encoder_loop():
         except Exception as status_e:
             print(f"DEBUG: Could not introspect Status enum: {status_e}")
         
+        # Write variety name before navigating to prevent flash of default string
+        write_variety_to_screen(1)
+
         result = te.guide.set_screen(ScreenID(target_screen))
         print(f"DEBUG: set_screen returned: {result} (type: {type(result)}, value: {result.value if hasattr(result, 'value') else result})")
-        
+
         # Wait a moment and verify the screen changed
         time.sleep(0.5)
         verify_screen = safe_get_screen()
@@ -734,6 +746,8 @@ def monitor_touch_encoder_loop():
                     airknife_mode,
                 )
                 time.sleep(2)
+                # Write variety name before navigating to prevent flash of default string
+                write_variety_to_screen(1)
                 # Return to variety selection screen
                 te.guide.set_screen(ScreenID(10))
 
@@ -816,6 +830,8 @@ def main():
                 te = discover_te_blocking()
                 try:
                     print("DEBUG: Attempting to set screen 10 after reconnect")
+                    # Write variety name before navigating to prevent flash of default string
+                    write_variety_to_screen(1)
                     te.guide.set_screen(ScreenID(10))
                     time.sleep(0.5)
                     verify = safe_get_screen()
