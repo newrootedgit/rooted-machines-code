@@ -345,12 +345,25 @@ void loop() {
     bool bladeFault = BladeMotor.StatusReg().bit.MotorInFault;
 
     // Belt fault edge detection
-    if (beltFault != t.lastBeltFault) {
-        if (beltFault) {
-            t.faultCountBelt++;
-            SendEvent("FAULT_BELT_RAISED", (int32_t)t.faultCountBelt);
-        } else {
-            SendEvent("FAULT_BELT_CLEARED", (int32_t)t.faultCountBelt);
+    if (beltFault && !t.lastBeltFault) {
+        t.faultCountBelt++;
+        if (BeltMotor.AlertReg().bit.MotorFaulted) { 
+          SendEvent("FAULT_BELT_MOTOR_FAULTED", (int32_t)t.faultCountBelt); 
+        }
+        else if (BeltMotor.AlertReg().bit.MotionCanceledPositiveLimit) { 
+          SendEvent("FAULT_BELT_POS_LIMIT", (int32_t)t.faultCountBelt);
+        }
+        else if (BeltMotor.AlertReg().bit.MotionCanceledNegativeLimit) { 
+          SendEvent("FAULT_BELT_NEG_LIMIT", (int32_t)t.faultCountBelt);
+        }
+        else if (BeltMotor.AlertReg().bit.MotionCanceledSensorEStop) { 
+          SendEvent("FAULT_BELT_ESTOP", (int32_t)t.faultCountBelt);
+        }
+        else if (BeltMotor.AlertReg().bit.MotionCanceledMotorDisabled) { 
+          SendEvent("FAULT_BELT_DISABLED", (int32_t)t.faultCountBlade);
+        }
+        else { 
+          SendEvent("FAULT_BELT_ALERT", (int32_t)t.faultCountBelt); 
         }
         t.lastBeltFault = beltFault;
     }
@@ -398,10 +411,11 @@ void loop() {
     switch (trayState) {
         case TRAY_IDLE:
             // Waiting for tray to be detected
-            if (trayDetected && !lastTrayDetected && airKnifeMode > 0) {
+            if (trayDetected && !lastTrayDetected) {
+              trayCount++;
+              if (airKnifeMode > 0) {
                 Serial.print("Tray switch: ACTIVE - airknife mode ");
                 Serial.println(airKnifeMode);
-                trayCount++;
                 SendEvent("TRAYSWITCH_ACTIVATED", 0);
 
                 if (airKnifeMode == 1 || airKnifeMode == 3) {
@@ -416,6 +430,7 @@ void loop() {
                     trayState = TRAY_WAIT_FIRST_PULSE;
                     Serial.println("  -> Waiting 1s for first top pulse");
                 }
+              }
             }
             break;
 
