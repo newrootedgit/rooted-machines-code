@@ -639,9 +639,11 @@ def monitor_touch_encoder_loop():
         if active_screen == ScreenID(VARIETY_NAME_SCREEN) and last_screen != ScreenID(VARIETY_NAME_SCREEN):
             current_variety_index = 1
             write_variety_to_screen(current_variety_index)
+            set_variable(VARIETY_NAME_SCREEN, 1, current_variety_index)
         if active_screen == ScreenID(EDIT_VARIETY_SCREEN) and last_screen != ScreenID(EDIT_VARIETY_SCREEN):
             current_variety_index = 1
             write_variety_to_screen(current_variety_index, EDIT_VARIETY_SCREEN, EDIT_VARIETY_VAR)
+            set_variable(EDIT_VARIETY_SCREEN, 1, current_variety_index)
         last_screen = active_screen
 
 
