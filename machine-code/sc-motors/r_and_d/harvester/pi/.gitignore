@@ -1,0 +1,17 @@
+# Pi-local state
+.mutagen/
+.cache/
+.ssh/
+.bashrc
+.bash_logout
+.profile
+.sudo_as_admin_successful
+
+# Downloaded/vendor SDK artifacts on the Pi
+teknic/
+
+# Local scratch area
+/tests/
+
+# Build outputs
+harvester-runtime/build/

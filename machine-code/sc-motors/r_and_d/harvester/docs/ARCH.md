@@ -35,6 +35,37 @@ It owns:
 
 ClearCore is not part of the motor control path. It is an auxiliary I/O coprocessor.
 
+## Runtime skeleton
+
+The agreed shape is one main runtime object with small collaborators below it.
+
+```cpp
+class Harvester {
+public:
+    Result submit(const HarvesterCommand& command);
+    void tick();
+    HarvesterState snapshot() const;
+
+private:
+    HarvesterState state_;
+
+    SafetySupervisor safety_;
+    HarvesterSequenceRunner sequences_;
+
+    BeltMotor belt_;
+    BladeMotor blade_;
+    RailMotor rail_;
+
+    ClearCoreClient clearcore_;
+    IClock& clock_;
+    ILogger& logger_;
+};
+```
+
+`Harvester` is the single runtime owner of machine state.
+
+It should coordinate work, not absorb every rule.
+
 ## Motor abstraction
 
 Motors should share a common axis abstraction, but machine code should still read in machine language.
@@ -45,6 +76,50 @@ Use:
 - thin typed wrappers such as `BeltMotor`, `BladeMotor`, and `RailMotor`
 
 The wrappers keep the machine code readable and let each motor expose the right semantics without pushing all behavior into one giant interface.
+
+```cpp
+class IAxis {
+public:
+    virtual ~IAxis() = default;
+    virtual Result enable() = 0;
+    virtual Result disable() = 0;
+    virtual Result stop() = 0;
+    virtual AxisStatus status() const = 0;
+};
+
+class IVelocityAxis : public virtual IAxis {
+public:
+    virtual Result set_velocity_rpm(int rpm) = 0;
+};
+
+class IPositionAxis : public virtual IAxis {
+public:
+    virtual Result move_to_mm(double position_mm) = 0;
+};
+```
+
+```cpp
+class BeltMotor {
+public:
+    explicit BeltMotor(IVelocityAxis& axis);
+    Result set_rpm(int rpm);
+    Result stop();
+};
+
+class BladeMotor {
+public:
+    explicit BladeMotor(IVelocityAxis& axis);
+    Result set_rpm(int rpm);
+    Result stop();
+};
+
+class RailMotor {
+public:
+    explicit RailMotor(IPositionAxis& axis);
+    Result move_to_mm(double mm);
+    Result stop();
+};
+```
 
 ## Safety
 
@@ -75,6 +150,21 @@ It owns:
 For the harvester, this includes things like height changes and resume behavior.
 
 For the seeder, the same pattern should apply, but with seeder-specific state and rules.
+
+```cpp
+class HarvesterSequenceRunner {
+public:
+    Result start(const HarvesterCommand& command,
+                 const HarvesterState& state,
+                 const SafetyState& safety);
+
+    std::vector<HarvesterEffect> tick(const HarvesterState& state,
+                                      const SafetyState& safety);
+
+    bool busy() const;
+    void cancel();
+};
+```
 
 ## Reuse boundary
 
@@ -107,6 +197,10 @@ Track separately:
 - safety state
 - sequence state
 
+
+State Retention (SC Series): If you are using the SC (Software Control) series with a PC, your software can keep track of the last known position. However, if the motor shaft is physically moved while the power is off, that position will be lost until the next homing cycle.
+
+
 Use:
 
 - a changed signal
@@ -116,6 +210,13 @@ Use:
 Do not rely on a bool-only `preset_changed` flag.
 
 The runtime should work toward the newest desired revision and mark it as applied only after the sequence completes successfully.
+
+```cpp
+struct DesiredPreset {
+    PresetValues values;
+    uint64_t revision = 0;
+};
+```
 
 ## ClearCore boundary
 
@@ -148,6 +249,80 @@ Benefits:
 Only the runtime loop should mutate `Harvester`.
 
 If external input polling becomes blocking later, threading can be added around the input side, but `Harvester` should still remain single-writer.
+
+The loop should stay simple:
+
+```cpp
+for (;;) {
+    poll_preset_source();
+    poll_clearcore_events();
+    refresh_motor_observation();
+
+    harvester.tick();
+
+    sleep_until_next_cycle();
+}
+```
+
+## File structure
+
+```text
+harvester/
+  docs/
+    ARCH.md
+    CLEARCORE.md
+    COMMUNICATION.md
+    DEVPLAN.md
+    INTENT.md
+    OTA.md
+    SETUP.md
+    TESTING.md
+  src/
+    Harvester.h
+    Harvester.cpp
+    HarvesterState.h
+    HarvesterCommand.h
+    HarvesterEffect.h
+    SafetySupervisor.h
+    SafetySupervisor.cpp
+    HarvesterSequenceRunner.h
+    HarvesterSequenceRunner.cpp
+    PresetState.h
+    ports/
+      IAxis.h
+      IVelocityAxis.h
+      IPositionAxis.h
+      IClock.h
+      ILogger.h
+      IKillSwitch.h
+      ITraySensor.h
+      IAirKnife.h
+      IClearCoreClient.h
+    motors/
+      BeltMotor.h
+      BeltMotor.cpp
+      BladeMotor.h
+      BladeMotor.cpp
+      RailMotor.h
+      RailMotor.cpp
+    adapters/
+      teknic/
+        TeknicAxis.h
+        TeknicAxis.cpp
+      clearcore/
+        ClearCoreClient.h
+        ClearCoreClient.cpp
+      io/
+    runtime/
+      main.cpp
+  tests/
+    unit/
+    component/
+    integration/
+    hardware/
+    fuzz/
+    fakes/
+```
 
 ## Diagram
 

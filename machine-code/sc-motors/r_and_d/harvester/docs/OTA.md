@@ -58,13 +58,7 @@ Rollback should not overwrite:
 
 Track runtime compatibility with ClearCore firmware explicitly.
 
-Each runtime release should declare:
-
-- runtime version
-- ClearCore protocol version
-- minimum supported ClearCore firmware version
-
-The Pi runtime should fail clearly if the connected ClearCore firmware is incompatible.
+Each runtime release declares the set of ClearCore commands and events it requires. On connect, ClearCore advertises its supported commands and events in the boot handshake (see `CLEARCORE.md`). The Pi compares and fails clearly if any required capability is missing.
 
 ## ClearCore
 
