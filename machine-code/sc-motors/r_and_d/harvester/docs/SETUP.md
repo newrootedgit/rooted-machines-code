@@ -238,6 +238,81 @@ Found 1 SC Hubs
 Interpretation:
 
 - the Pi opened the SC Hub successfully
+
+## 9. Field reliability risk: kernel updates can break SC discovery
+
+The Teknic/Exar SC Hub driver is an out-of-tree kernel module. If the Pi boots into a
+new kernel that does not have a matching `xr_usb_serial_common` build installed, the hub
+will typically fall back to the kernel's built-in `cdc_acm` driver.
+
+When that happens:
+
+- the hub enumerates as `/dev/ttyACM0` instead of `/dev/ttyXRUSB0`
+- `sFoundation` does not discover the SC Hub
+- the harvester runtime fails at startup with `No SC Hub ports found`
+- motors do not come online
+
+This is a machine-down condition after reboot, not a motion-safety runaway condition. The
+expected failure mode is that startup aborts cleanly and the machine remains unavailable
+until the driver is restored for the running kernel.
+
+### How to recognize this failure
+
+Symptoms:
+
+- `ls /dev/ttyXRUSB*` shows nothing
+- `ls /dev/ttyACM*` shows `/dev/ttyACM0`
+- `modinfo xr_usb_serial_common` returns nothing or does not match `uname -r`
+- `dmesg` shows the SC Hub bound to `cdc_acm`
+
+Example bad state:
+
+```text
+usb 4-2: New USB device found, idVendor=2890, idProduct=0213
+usb 4-2: Product: 4-axis Comm Hub
+cdc_acm 4-2:1.0: ttyACM0: USB ACM device
+```
+
+### Recovery
+
+Check the running kernel and whether the Exar module exists:
+
+```bash
+uname -r
+modinfo xr_usb_serial_common 2>/dev/null | grep -iE 'filename|alias|vermagic'
+lsmod | grep -E 'xr_usb|cdc_xr|cdc_acm'
+```
+
+If `modinfo xr_usb_serial_common` returns nothing, the module is not installed for the
+current kernel. Rebuild/reinstall the Teknic driver against the running kernel, then:
+
+```bash
+sudo modprobe xr_usb_serial_common
+```
+
+Unplug/replug the hub and verify:
+
+```bash
+ls /dev/ttyXRUSB*
+lsusb -t
+```
+
+### Production mitigations
+
+For field machines, do not assume the SC driver survives arbitrary kernel updates. Use one
+or more of the following:
+
+- pin the Pi kernel to a tested version
+- disable unattended kernel upgrades on deployed machines
+- package the Exar driver with DKMS if feasible so it rebuilds on kernel changes
+- add a boot-time/service startup health check that verifies:
+  - `xr_usb_serial_common` exists
+  - `/dev/ttyXRUSB*` exists
+  - `sFoundation` can discover the SC Hub
+- fail clearly and raise an alert if the system comes up on `ttyACM0`
+
+The key operational rule is: a successful SC setup on one boot does not guarantee the
+driver will still be present after a kernel change.
 - `sFoundation` enumerated the hub
 - one node was found on the bus
 - port state `5` indicates the port is ready

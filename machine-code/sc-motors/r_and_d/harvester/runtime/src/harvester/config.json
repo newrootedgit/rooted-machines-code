@@ -1,0 +1,21 @@
+{
+  "axes": {
+    "belt": {
+      "vel_limit_rpm": 700,
+      "acc_limit_rpm_per_sec": 100000,
+      "velocity_timeout_ms": 3000.0
+    },
+    "blade": {
+      "vel_limit_rpm": 700,
+      "acc_limit_rpm_per_sec": 100000,
+      "velocity_timeout_ms": 3000.0
+    },
+    "rail": {
+      "vel_limit_rpm": 700,
+      "acc_limit_rpm_per_sec": 100000,
+      "counts_per_mm": 397.0,
+      "move_timeout_ms": 10000.0,
+      "home_timeout_ms": 15000.0
+    }
+  }
+}
