@@ -12,6 +12,7 @@ public:
     virtual void sleep_ms(std::uint32_t duration_ms) = 0;
 };
 
+
 class SFoundationClock : public IClock {
 public:
     std::uint64_t now_ms() const override {
@@ -22,5 +23,6 @@ public:
         sFnd::SysManager::Instance()->Delay(duration_ms);
     }
 };
+
 
 #endif

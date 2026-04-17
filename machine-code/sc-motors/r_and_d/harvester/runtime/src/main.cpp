@@ -2,6 +2,7 @@
 #include "../include/utils/Axis.h"
 #include "../include/utils/SFoundationClock.h"
 #include "../include/utils/TouchEncoderState.h"
+#include "../include/harvester/MachineConfig.h"
 #include <cstdio>
 
 int main() {
@@ -30,13 +31,8 @@ int main() {
     }
     printf("All nodes enabled\n");
 
-    VelocityAxisConfig belt_config;
-    belt_config.vel_limit_rpm = 120;
-    belt_config.acc_limit_rpm_per_sec = 100000;
-    belt_config.velocity_timeout_ms = 3000.0;
-
     SFoundationClock clock;
-    SCVelocityAxis belt(client.node(0), belt_config);
+    SCVelocityAxis belt(client.node(0), harvester::machine::kBelt);
     TouchEncoderState te_state(TE_JSON_PATH);
 
     bool last_ready_to_run = false;
@@ -81,7 +77,9 @@ int main() {
                 if (r.code != ResultCode::Ok) {
                     printf("Velocity move failed: %s\n", r.message);
                 } else {
-                    printf("Belt commanded to %d RPM\n", belt_speed);
+                    printf("Belt commanded at TE=%d (scaled to %d RPM)\n",
+                           belt_speed,
+                           belt_speed * harvester::machine::kBelt.rpm_per_te_unit);
                 }
             }
 
