@@ -1,6 +1,8 @@
 #include "../include/utils/ClearCoreClient.h"
 #include <cstdio>
 
+using namespace sFnd;
+
 ClearCoreClient::ClearCoreClient(const ClearCoreConfig& config)
     : config_(config) {}
 

@@ -37,6 +37,11 @@ Result SCVelocityAxis::set_velocity_rpm(int rpm) {
             clamped_rpm = -config_.vel_limit_rpm;
         }
 
+        if (config_.mode == VelocityDriveMode::InputTriggered) {
+            node_.Motion.Adv.MoveVelStart(clamped_rpm, true);
+            return {ResultCode::Ok};
+        }
+
         node_.Motion.MoveVelStart(clamped_rpm);
 
         sFnd::SysManager* mgr = sFnd::SysManager::Instance();

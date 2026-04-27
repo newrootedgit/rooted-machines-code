@@ -6,19 +6,17 @@
 #include <vector>
 #include <string>
 
-using namespace sFnd;
 
-
-class ClearCoreClient { 
-    public: 
-        ~ClearCoreClient(); 
+class ClearCoreClient {
+    public:
+        ~ClearCoreClient();
         explicit ClearCoreClient(const ClearCoreConfig& Config);
 
-        Result init(); 
-        void shutdown(); 
+        Result init();
+        void shutdown();
 
 
-        INode& node(size_t index);
+        sFnd::INode& node(size_t index);
         size_t node_count() const;
 
         Result enable_node(size_t index);
@@ -30,7 +28,7 @@ class ClearCoreClient {
 
     private:
         ClearCoreConfig config_;
-        SysManager* mgr_ = nullptr;
+        sFnd::SysManager* mgr_ = nullptr;
         size_t open_port_count_ = 0;
         bool initialized_ = false;
         std::vector<std::string> discovered_ports_;

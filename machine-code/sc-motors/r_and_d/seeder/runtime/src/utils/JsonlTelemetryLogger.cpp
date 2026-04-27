@@ -1,4 +1,4 @@
-#include "utils/JsonlTelemetryLogger.h"
+#include "telemetry/JsonlTelemetryLogger.h"
 
 #include <nlohmann/json.hpp>
 #include <ctime>
@@ -99,84 +99,6 @@ Result JsonlTelemetryLogger::log_event(const MachineEvent& event) {
 }
 
 
-Result JsonlTelemetryLogger::event_handler(
-    uint64_t boot_id,
-    uint64_t seq,
-    uint64_t timestamp_ms,
-    TelemetryEventType event_type,
-    const std::string& role,
-    int node_index,
-    int64_t value_i64
-) {
-    MachineEvent event;
-    event.boot_id = boot_id;
-    event.seq = seq;
-    event.timestamp_ms = timestamp_ms;
-    event.type = event_type;
-    event.role = role;
-    event.node_index = node_index;
-    event.value_i64 = value_i64;
-
-    return log_event(event);
-}
-
-Result JsonlTelemetryLogger::status_update_handler(
-    uint64_t boot_id,
-    uint64_t seq,
-    uint64_t timestamp_ms,
-    bool ready_to_run,
-    bool kill_ok,
-    bool fault_latched,
-    int active_variety,
-    int belt_speed,
-    uint64_t tray_count,
-    int belt_node_index,
-    int belt_serial,
-    const std::string& belt_model,
-    const std::string& belt_firmware,
-    const AxisStatus& belt_status,
-    bool belt_bus_power_ok,
-    double belt_measured_velocity,
-    uint64_t belt_active_uptime_ms,
-    uint32_t belt_alert_bits
-) {
-    MachineSnapshot snapshot;
-    snapshot.boot_id = boot_id;
-    snapshot.seq = seq;
-    snapshot.timestamp_ms = timestamp_ms;
-    snapshot.uptime_ms = timestamp_ms >= boot_id ? timestamp_ms - boot_id : 0;
-    snapshot.ready_to_run = ready_to_run;
-    snapshot.kill_ok = kill_ok;
-    snapshot.fault_latched = fault_latched;
-    snapshot.active_variety = active_variety;
-    snapshot.belt_speed = belt_speed;
-    snapshot.tray_count = tray_count;
-
-    MotorSnapshot belt_snapshot;
-    belt_snapshot.role = "belt";
-    belt_snapshot.node_index = belt_node_index;
-    belt_snapshot.serial = belt_serial;
-    belt_snapshot.model = belt_model;
-    belt_snapshot.firmware = belt_firmware;
-    belt_snapshot.enabled = belt_status.enabled;
-    belt_snapshot.ready = belt_status.enabled;
-    belt_snapshot.moving = belt_status.moving;
-    belt_snapshot.faulted = belt_status.faulted;
-    belt_snapshot.bus_power_ok = belt_bus_power_ok;
-    belt_snapshot.measured_velocity = belt_measured_velocity;
-    belt_snapshot.active_uptime_ms = belt_active_uptime_ms;
-    belt_snapshot.alert_bits = belt_alert_bits;
-
-    snapshot.motors.push_back(belt_snapshot);
-
-    return log_snapshot(snapshot);
-}
-
-
-
-
-// --------------------------------------------------------------------------
-
 Result JsonlTelemetryLogger::log_snapshot(const MachineSnapshot& snapshot) {
     Result r = ensure_open();
     if (r.code != ResultCode::Ok) {
@@ -195,7 +117,6 @@ Result JsonlTelemetryLogger::log_snapshot(const MachineSnapshot& snapshot) {
         {"uptime_ms", snapshot.uptime_ms},
         {"uptime_s", snapshot.uptime_ms / 1000},
         {"delta_steps", 0},
-        // {"torque_pct", belt && belt->load_metric_valid ? belt->load_metric_pct : 0},
         {"torque_pct", 0},
         {"belt_fault", belt && belt->faulted ? 1 : 0},
         {"blade_fault", blade && blade->faulted ? 1 : 0},
@@ -211,8 +132,6 @@ Result JsonlTelemetryLogger::log_snapshot(const MachineSnapshot& snapshot) {
         {"received_at", received_at_epoch_seconds()},
         {"fault_type", ""},
         {"motor", belt ? belt->role : ""},
-        // {"active_variety", snapshot.active_variety},
-        // {"belt_speed", snapshot.belt_speed},
         {"ready_to_run", snapshot.ready_to_run},
     };
 

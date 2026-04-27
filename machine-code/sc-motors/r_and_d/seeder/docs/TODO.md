@@ -1,0 +1,4 @@
+- [ ] Add reset for motor faulting
+- [ ] Work on Safety Supervisor
+- [X] Figure out the whole main.cpp situation
+- [ ] We don't need to log half the shit we are right now

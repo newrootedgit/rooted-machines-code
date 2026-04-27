@@ -18,6 +18,10 @@ public:
         return values_.belt_speed;
     }
 
+    int roller_speed() const {
+        return values_.roller_speed;
+    }
+
     bool ready_to_run() const {
         return values_.ready_to_run;
     }

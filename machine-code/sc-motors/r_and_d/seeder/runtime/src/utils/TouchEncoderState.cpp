@@ -33,11 +33,13 @@ Result TouchEncoderState::refresh() {
         values_.ready_to_run = json.value("ready_to_run", false);
         values_.active_variety = json.value("active_variety", -1);
         values_.belt_speed = 0;
+        values_.roller_speed = 0;
 
         if (values_.active_variety >= 0) {
             const std::string variety_key = std::to_string(values_.active_variety);
             if (json.contains(variety_key) && json[variety_key].is_object()) {
                 values_.belt_speed = json[variety_key].value("belt_speed", 0);
+                values_.roller_speed = json[variety_key].value("roller_speed", values_.belt_speed);
             }
         }
 

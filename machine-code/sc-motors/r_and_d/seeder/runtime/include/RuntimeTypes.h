@@ -26,21 +26,17 @@ struct SafetyState {
     bool fault_latched = false;
 };
 
-struct SeederCommand {};
-
-struct SeederEffect {};
-
-struct SeederState;
+struct PhotoeyeStatus {
+    bool blocked = false;
+    bool triggered_this_refresh = false;
+    std::uint64_t trigger_count = 0;
+};
 
 struct PresetValues {
     bool ready_to_run = false;
     int active_variety = -1;
     int belt_speed = 0;
-};
-
-struct DesiredPreset {
-    PresetValues values {};
-    std::uint64_t revision = 0;
+    int roller_speed = 0;
 };
 
 struct ClearCoreConfig {

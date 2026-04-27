@@ -23,12 +23,21 @@ public:
     virtual Result move_to_mm(double position_mm) = 0;
 };
 
+enum class VelocityDriveMode {
+    // Pi commands the velocity; motor ramps under configured accel/decel limits.
+    RampToVelocity,
+    // Motor's own input pin (pre-configured via ClearView) fires the move;
+    // Pi only pushes the setpoint and does not wait on VelocityAtTarget.
+    InputTriggered,
+};
+
 struct VelocityAxisConfig {
     int vel_limit_rpm = 700;
     int acc_limit_rpm_per_sec = 100000;
     double velocity_timeout_ms = 3000.0;
     // TE-unit → RPM scale. Sign flips direction. Default 1 = passthrough.
     int rpm_per_te_unit = 1;
+    VelocityDriveMode mode = VelocityDriveMode::RampToVelocity;
 };
 
 struct PositionAxisConfig {
@@ -38,6 +47,7 @@ struct PositionAxisConfig {
     double move_timeout_ms = 10000.0;
     double home_timeout_ms = 15000.0;
 };
+
 
 class SCVelocityAxis : public IVelocityAxis {
 public:
@@ -56,6 +66,7 @@ private:
     VelocityAxisConfig config_;
 };
 
+// This is for the rail axis, not used in seeder
 class SCPositionAxis : public IPositionAxis {
 public:
     SCPositionAxis(sFnd::INode& node, const PositionAxisConfig& config);
