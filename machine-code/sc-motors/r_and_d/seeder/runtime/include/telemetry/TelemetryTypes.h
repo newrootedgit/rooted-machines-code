@@ -13,6 +13,11 @@ enum class TelemetryEventType {
     FaultEntered,
     FaultCleared,
     TrayCountIncremented,
+    RollerLingerStarted,
+    RollerLingerEnded,
+    RollerLingerCancelled,
+    SolenoidPulseStarted,
+    SolenoidPulseEnded,
 };
 
 struct MachineEvent {

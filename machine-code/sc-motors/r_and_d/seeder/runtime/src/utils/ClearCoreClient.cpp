@@ -102,6 +102,10 @@ INode& ClearCoreClient::node(size_t index) {
     return mgr_->Ports(0).Nodes(index);
 }
 
+IPort& ClearCoreClient::port() {
+    return mgr_->Ports(0);
+}
+
 size_t ClearCoreClient::node_count() const {
     if (!initialized_) return 0;
     return mgr_->Ports(0).NodeCount();

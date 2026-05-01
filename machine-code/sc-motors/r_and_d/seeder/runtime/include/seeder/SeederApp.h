@@ -6,6 +6,8 @@
 #include "../utils/ClearCoreClient.h"
 #include "../utils/IClock.h"
 #include "../utils/IInput.h"
+#include "../utils/SCNodeInput.h"
+#include "../utils/SCBrakeOutput.h"
 #include "../telemetry/ITelemetrySink.h"
 #include "../utils/SafetySupervisor.h"
 #include "../utils/TouchEncoderState.h"
@@ -54,6 +56,10 @@ private:
     void update_previous_state(const MachineState& current_state);
     bool belt_active(const MachineState& current_state) const;
     bool roller_active(const MachineState& current_state) const;
+    bool roller_uptime_active(const MachineState& current_state) const;
+    bool roller_should_run(const MachineState& current_state) const;
+    void update_roller_linger(const MachineState& current_state, std::uint64_t now_ms);
+    void update_solenoid_pulse(bool is_blocked, std::uint64_t now_ms);
     std::size_t roller_node_index() const;
 
     ClearCoreClient client_;
@@ -63,7 +69,9 @@ private:
     SafetySupervisor safety_;
     std::optional<SCVelocityAxis> belt_;
     std::optional<SCVelocityAxis> roller_;
+    std::optional<SCNodeInput> roller_input_;
     std::optional<Photoeye> photoeye_;
+    std::optional<SCBrakeOutput> solenoid_;
 
     std::uint64_t boot_id_ = 0;
     std::uint64_t telemetry_seq_ = 0;
@@ -72,6 +80,13 @@ private:
     std::uint64_t belt_uptime_ms_ = 0;
     std::uint64_t roller_uptime_ms_ = 0;
     MachineState previous_state_;
+
+    bool previous_blocked_ = false;
+    std::uint64_t roller_stop_deadline_ms_ = 0;
+    int linger_belt_speed_latched_ = 0;
+
+    std::uint64_t solenoid_off_deadline_ms_ = 0;
+    bool solenoid_armed_ = false;
 };
 
 #endif

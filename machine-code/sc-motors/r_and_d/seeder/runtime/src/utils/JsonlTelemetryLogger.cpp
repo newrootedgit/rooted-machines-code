@@ -17,6 +17,16 @@ static const char* telemetry_event_code_to_string(TelemetryEventType type) {
             return "FAULT_CLEARED";
         case TelemetryEventType::TrayCountIncremented:
             return "TRAY_COUNT_INCREMENTED";
+        case TelemetryEventType::RollerLingerStarted:
+            return "ROLLER_LINGER_STARTED";
+        case TelemetryEventType::RollerLingerEnded:
+            return "ROLLER_LINGER_ENDED";
+        case TelemetryEventType::RollerLingerCancelled:
+            return "ROLLER_LINGER_CANCELLED";
+        case TelemetryEventType::SolenoidPulseStarted:
+            return "SOLENOID_PULSE_STARTED";
+        case TelemetryEventType::SolenoidPulseEnded:
+            return "SOLENOID_PULSE_ENDED";
     }
 
     return "UNKNOWN";
@@ -73,12 +83,12 @@ Result JsonlTelemetryLogger::log_event(const MachineEvent& event) {
         {"delta_steps", 0},
         {"torque_pct", 0},
         {"belt_fault", 0},
-        {"blade_fault", 0},
+        {"roller_fault", 0},
         {"alert_bits", 0},
         {"kill_switch", 0},
         {"cmd_age_ms", 0},
         {"belt_motor_uptime_ms", 0},
-        {"blade_motor_uptime_ms", 0},
+        {"roller_motor_uptime_ms", 0},
         {"udp_fail_count", 0},
         {"event_code", telemetry_event_code_to_string(event.type)},
         {"event_value", event.value_i64},
@@ -106,7 +116,7 @@ Result JsonlTelemetryLogger::log_snapshot(const MachineSnapshot& snapshot) {
     }
 
     const MotorSnapshot* belt = find_motor(snapshot.motors, "belt");
-    const MotorSnapshot* blade = find_motor(snapshot.motors, "blade");
+    const MotorSnapshot* roller = find_motor(snapshot.motors, "roller");
 
     json j = {
         {"type", "status_update"},
@@ -119,12 +129,12 @@ Result JsonlTelemetryLogger::log_snapshot(const MachineSnapshot& snapshot) {
         {"delta_steps", 0},
         {"torque_pct", 0},
         {"belt_fault", belt && belt->faulted ? 1 : 0},
-        {"blade_fault", blade && blade->faulted ? 1 : 0},
+        {"roller_fault", roller && roller->faulted ? 1 : 0},
         {"alert_bits", belt ? belt->alert_bits : 0},
         {"kill_switch", snapshot.kill_ok ? 1 : 0},
         {"cmd_age_ms", 0},
         {"belt_motor_uptime_ms", belt ? belt->active_uptime_ms : 0},
-        {"blade_motor_uptime_ms", blade ? blade->active_uptime_ms : 0},
+        {"roller_motor_uptime_ms", roller ? roller->active_uptime_ms : 0},
         {"udp_fail_count", 0},
         {"event_code", ""},
         {"event_value", 0},

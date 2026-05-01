@@ -40,6 +40,20 @@ Result SeederApp::boot() {
         printf("Single-node setup detected: roller mapped to %s\n",
                seeder::machine::kRollerSingleNodeAxisLabel);
     }
+
+    // Photoeye reads off the roller motor's input pin; SCNodeInput must be emplaced
+    // before Photoeye so the IInput& reference stays valid for SeederApp's lifetime.
+    if (roller_.has_value()) {
+        roller_input_.emplace(client_.node(roller_node_index()));
+        photoeye_.emplace(*roller_input_, PhotoeyeConfig{});
+    }
+
+    solenoid_.emplace(client_.port(), seeder::machine::kSolenoidBrakeNum);
+    Result solr = solenoid_->set_off();
+    if (solr.code != ResultCode::Ok) {
+        printf("Solenoid initial set_off failed: %s\n", solr.message);
+    }
+
     safety_.set_kill_ok(true);
     return {ResultCode::Ok};
 }
@@ -64,11 +78,19 @@ Result SeederApp::start() {
 // THIS IS THE MAIN CONTROL LOGIC, RUNS EVERY LOOP ITERATION
 Result SeederApp::run_once() {
 
-    // Read TE_vars, fail silently, wait 100ms and try again
+    // Read TE_vars, fail silently, wait 100ms and try again.
     Result r = te_state_.refresh();
     if (r.code != ResultCode::Ok) {
         printf("Touch encoder refresh failed: %s\n", r.message);
         return {ResultCode::Ok};
+    }
+
+    // Refresh photoeye level; ignore transient SDK read failures (one stale tick).
+    if (photoeye_.has_value()) {
+        Result pe_r = photoeye_->refresh();
+        if (pe_r.code != ResultCode::Ok) {
+            printf("Photoeye refresh failed: %s\n", pe_r.message);
+        }
     }
 
     // Latch faults based on current axis status and bus power.
@@ -92,20 +114,30 @@ Result SeederApp::run_once() {
     if (belt_active(state_after_safety)) {
         belt_uptime_ms_ += elapsed_ms;
     }
-    if (roller_active(state_after_safety)) {
+
+    handle_ready_change(state_after_safety, now_ms);
+    handle_fault_change(state_after_safety, now_ms);
+
+    // Photoeye edge detection + linger window; may emit telemetry and stop the
+    // roller directly on deadline expiry.
+    const bool is_blocked_now = photoeye_.has_value() && photoeye_->blocked();
+    update_solenoid_pulse(is_blocked_now, now_ms);
+    update_roller_linger(state_after_safety, now_ms);
+    if (roller_uptime_active(state_after_safety)) {
         roller_uptime_ms_ += elapsed_ms;
     }
     last_uptime_sample_ms_ = now_ms;
 
-    handle_ready_change(state_after_safety, now_ms);
-    handle_fault_change(state_after_safety, now_ms);
+    const bool is_blocked = is_blocked_now;
+    const bool photoeye_edge = is_blocked != previous_blocked_;
 
     const bool state_changed =
         !previous_state_.initialized ||
         state_after_safety.ready_to_run != previous_state_.ready_to_run ||
         state_after_safety.active_variety != previous_state_.active_variety ||
         state_after_safety.belt_speed != previous_state_.belt_speed ||
-        state_after_safety.roller_speed != previous_state_.roller_speed;
+        state_after_safety.roller_speed != previous_state_.roller_speed ||
+        photoeye_edge;
 
     if (state_changed) {
         apply_motion_command(state_after_safety);
@@ -120,6 +152,7 @@ Result SeederApp::run_once() {
     }
 
     update_previous_state(state_after_safety);
+    previous_blocked_ = is_blocked;
     return {ResultCode::Ok};
 }
 
@@ -175,6 +208,12 @@ void SeederApp::handle_ready_change(const SeederApp::MachineState& current_state
     if (r.code != ResultCode::Ok) {
         printf("Telemetry ready event failed: %s\n", r.message);
     }
+
+    // Master switch off is a hard stop — cancel any pending linger so the roller
+    // doesn't keep running through the operator's intent.
+    if (!current_state.ready_to_run) {
+        roller_stop_deadline_ms_ = 0;
+    }
 }
 
 void SeederApp::handle_fault_change(const SeederApp::MachineState& current_state, std::uint64_t now_ms) {
@@ -202,6 +241,7 @@ void SeederApp::handle_fault_change(const SeederApp::MachineState& current_state
     }
 
     if (current_state.fault_latched) {
+        roller_stop_deadline_ms_ = 0;
         stop_all_axes();
     }
 }
@@ -233,12 +273,16 @@ void SeederApp::apply_motion_command(const SeederApp::MachineState& current_stat
     }
 
     if (roller_.has_value()) {
-        apply_axis_motion(
-            *roller_,
-            seeder::machine::kRoller,
-            "roller",
-            current_state.roller_speed,
-            current_state);
+        if (roller_should_run(current_state)) {
+            apply_axis_motion(
+                *roller_,
+                seeder::machine::kRoller,
+                "roller",
+                current_state.roller_speed,
+                current_state);
+        } else {
+            stop_axis(*roller_, "roller");
+        }
         if (safety_.state().fault_latched) {
             stop_all_axes();
         }
@@ -325,9 +369,7 @@ void SeederApp::emit_status_snapshot(const SeederApp::MachineState& current_stat
     snapshot.tray_count = 0;
 
     MotorSnapshot motor;
-    // Schema parity: legacy field set keys per-motor data on role == "belt",
-    // even on single-node setups where we are actually reporting the roller.
-    motor.role = "belt";
+    motor.role = report_roller ? "roller" : "belt";
     motor.node_index = static_cast<int>(node_index);
     motor.serial = client_.node(node_index).Info.SerialNumber.Value();
     motor.model = client_.node(node_index).Info.Model.Value();
@@ -367,6 +409,150 @@ bool SeederApp::roller_active(const SeederApp::MachineState& current_state) cons
     }
 
     return roller_.has_value() && current_state.roller_speed > 0;
+}
+
+bool SeederApp::roller_uptime_active(const SeederApp::MachineState& current_state) const {
+    if (!roller_.has_value() || !current_state.ready_to_run || current_state.fault_latched) {
+        return false;
+    }
+
+    // With the photoeye installed, roller active time is the tray-triggered run
+    // window, not merely the configured roller speed. Speed remains the fallback
+    // only for setups that do not expose a photoeye input.
+    if (!photoeye_.has_value()) {
+        return current_state.roller_speed > 0;
+    }
+
+    return photoeye_->blocked() || roller_stop_deadline_ms_ != 0;
+}
+
+bool SeederApp::roller_should_run(const SeederApp::MachineState& current_state) const {
+    if (!roller_active(current_state)) {
+        return false;
+    }
+    // Without a photoeye, fall back to legacy "always run when commanded".
+    if (!photoeye_.has_value()) {
+        return true;
+    }
+    // Run while a tray is in zone, or while a linger window is still open.
+    return photoeye_->blocked() || roller_stop_deadline_ms_ != 0;
+}
+
+void SeederApp::update_roller_linger(const SeederApp::MachineState& current_state, std::uint64_t now_ms) {
+    if (!photoeye_.has_value() || !roller_.has_value()) {
+        return;
+    }
+
+    const bool is_blocked = photoeye_->blocked();
+    const int speed = current_state.belt_speed;
+
+    auto emit = [&](TelemetryEventType type, std::int64_t value) {
+        MachineEvent event;
+        event.boot_id = boot_id_;
+        event.seq = ++telemetry_seq_;
+        event.timestamp_ms = now_ms;
+        event.type = type;
+        event.role = "roller";
+        event.node_index = static_cast<int>(roller_node_index());
+        event.value_i64 = value;
+        Result r = telemetry_.log_event(event);
+        if (r.code != ResultCode::Ok) {
+            printf("Telemetry linger event failed: %s\n", r.message);
+        }
+    };
+
+    if (previous_blocked_ && !is_blocked) {
+        // Falling edge: arm the linger if belt is feeding; otherwise let the normal
+        // photoeye gate stop the roller this tick (no flush needed at zero feed).
+        std::uint64_t linger_ms = 0;
+        if (speed > 0) {
+            linger_ms = static_cast<std::uint64_t>(seeder::machine::kRollerLingerScale) /
+                        static_cast<std::uint64_t>(speed);
+            if (linger_ms > seeder::machine::kRollerMaxLingerMs) {
+                linger_ms = seeder::machine::kRollerMaxLingerMs;
+            }
+        }
+        if (linger_ms > 0) {
+            roller_stop_deadline_ms_ = now_ms + linger_ms;
+            linger_belt_speed_latched_ = speed;
+            emit(TelemetryEventType::RollerLingerStarted,
+                 static_cast<std::int64_t>(linger_ms));
+        }
+    } else if (!previous_blocked_ && is_blocked) {
+        // Rising edge: tray came back, cancel any pending stop.
+        if (roller_stop_deadline_ms_ != 0) {
+            roller_stop_deadline_ms_ = 0;
+            emit(TelemetryEventType::RollerLingerCancelled, 0);
+        }
+    } else if (roller_stop_deadline_ms_ != 0 && now_ms >= roller_stop_deadline_ms_) {
+        // Deadline expired with photoeye still clear: stop the roller.
+        roller_stop_deadline_ms_ = 0;
+        stop_axis(*roller_, "roller");
+        emit(TelemetryEventType::RollerLingerEnded,
+             static_cast<std::int64_t>(linger_belt_speed_latched_));
+    }
+}
+
+void SeederApp::update_solenoid_pulse(bool is_blocked, std::uint64_t now_ms) {
+    if (!solenoid_.has_value()) {
+        return;
+    }
+
+    auto emit = [&](TelemetryEventType type, std::int64_t value) {
+        MachineEvent event;
+        event.boot_id = boot_id_;
+        event.seq = ++telemetry_seq_;
+        event.timestamp_ms = now_ms;
+        event.type = type;
+        event.role = "solenoid";
+        event.node_index = -1;
+        event.value_i64 = value;
+        Result r = telemetry_.log_event(event);
+        if (r.code != ResultCode::Ok) {
+            printf("Telemetry solenoid event failed: %s\n", r.message);
+        }
+    };
+
+    // Ignore edges for the first kSolenoidArmDelayMs after start(). The
+    // SC-Hub input can bounce for several ticks during initial comm cycles,
+    // and previous_blocked_ defaults to false so the first stable read also
+    // looks like an edge. boot_id_ is set in start() to clock_.now_ms().
+    if (!solenoid_armed_) {
+        if (boot_id_ != 0 && now_ms - boot_id_ >= seeder::machine::kSolenoidArmDelayMs) {
+            solenoid_armed_ = true;
+            printf("[solenoid] armed @ %llu ms\n",
+                   static_cast<unsigned long long>(now_ms));
+        } else {
+            return;
+        }
+    }
+
+    if (!previous_blocked_ && is_blocked) {
+        printf("[solenoid] rising edge @ %llu ms -> set_on (brake_num=%zu, pulse=%llu ms)\n",
+               static_cast<unsigned long long>(now_ms),
+               seeder::machine::kSolenoidBrakeNum,
+               static_cast<unsigned long long>(seeder::machine::kSolenoidPulseMs));
+        Result r = solenoid_->set_on();
+        if (r.code != ResultCode::Ok) {
+            printf("[solenoid] set_on failed: %s\n", r.message);
+            return;
+        }
+        printf("[solenoid] set_on OK\n");
+        solenoid_off_deadline_ms_ = now_ms + seeder::machine::kSolenoidPulseMs;
+        emit(TelemetryEventType::SolenoidPulseStarted,
+             static_cast<std::int64_t>(seeder::machine::kSolenoidPulseMs));
+    } else if (solenoid_off_deadline_ms_ != 0 && now_ms >= solenoid_off_deadline_ms_) {
+        printf("[solenoid] deadline reached @ %llu ms -> set_off\n",
+               static_cast<unsigned long long>(now_ms));
+        Result r = solenoid_->set_off();
+        if (r.code != ResultCode::Ok) {
+            printf("[solenoid] set_off failed: %s\n", r.message);
+        } else {
+            printf("[solenoid] set_off OK\n");
+        }
+        solenoid_off_deadline_ms_ = 0;
+        emit(TelemetryEventType::SolenoidPulseEnded, 0);
+    }
 }
 
 std::size_t SeederApp::roller_node_index() const {

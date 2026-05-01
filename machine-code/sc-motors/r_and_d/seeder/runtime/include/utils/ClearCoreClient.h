@@ -17,6 +17,7 @@ class ClearCoreClient {
 
 
         sFnd::INode& node(size_t index);
+        sFnd::IPort& port();
         size_t node_count() const;
 
         Result enable_node(size_t index);
