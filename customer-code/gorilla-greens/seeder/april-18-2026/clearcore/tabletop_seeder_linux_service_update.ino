@@ -1,35 +1,21 @@
 #include <Arduino.h>
-#include <Arduino.h>
 #include <SPI.h>
 #include <Ethernet.h>
 #include "ClearCore.h"
 
-#define BeltMotor ConnectorM0
-#define HopperMotor ConnectorM2
-#define INPUT_A_B_FILTER 20
-#define HANDLE_ALERTS (1)
-#define HANDLE_MOTOR_FAULTS (1)
-
-// Not connected. Select a board and a port to connect automatically.
-// Both NL & CR
-
-#include <SPI.h>
-#include <Ethernet.h>
-#include "ClearCore.h"
-
-#define BeltMotor ConnectorM0
-#define HopperMotor ConnectorM2
+#define BeltMotor ConnectorM1
+#define HopperMotor ConnectorM3
 #define INPUT_A_B_FILTER 20
 #define HANDLE_ALERTS (1)
 #define HANDLE_MOTOR_FAULTS (1)
 
 int accelerationLimit = 100000; // pulses per sec^2
 
-#define inputPin1 IO3  // Belt Start trigger
-#define inputPin2 IO2  // Belt Reset trigger
+#define inputPin1 DI6  // Belt Start trigger
+#define inputPin2 DI7  // Belt Reset trigger
 
-#define relay0Pin IO0 // Irrigation output
-#define relay1Pin IO1 // Misting output
+#define relay0Pin IO4 // Irrigation output
+#define relay1Pin IO5 // Misting output
 
 byte mac[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED};  // MAC address
 IPAddress ip(192, 168, 10, 2);                      // Static IP
@@ -201,6 +187,7 @@ void parseReceivedMessage(char *message) {
 
     // Temporary locals to hold parsed values
     int ready_to_run_int = 0;
+    int active_variety = 0;
     float belt_speed_val = 0;
     float roller_speed_val = 0;
     float irrigation_delay_val = 0;
@@ -217,6 +204,7 @@ void parseReceivedMessage(char *message) {
                 break;
             case 1: // active_variety (we can ignore for now or store if needed)
                 // int active_variety = atoi(token);
+                active_variety = atoi(token);
                 break;
             case 2: // roller_speed
                 roller_speed_val = atof(token);
@@ -279,6 +267,7 @@ void parseReceivedMessage(char *message) {
     // Debug prints if you want them:
     
     Serial.println("Parsed CSV Data:");
+    Serial.print("active_variety: "); Serial.println(active_variety);
     Serial.print("ready_to_run_flag: "); Serial.println(ready_to_run_flag);
     Serial.print("user_belt_rpm: "); Serial.println(user_belt_rpm);
     Serial.print("user_hopper_rpm: "); Serial.println(user_hopper_rpm);
@@ -455,7 +444,7 @@ void loop() {
   ////////////////////////////////////////////////////////////
 
   bool inputState = digitalRead(inputPin1);
-
+  Serial.print("here"); Serial.println(inputState);
   if (inputState && !sequenceActive && ready_to_run_flag) {
       // If DI-6 is triggered and sequence is not already running, start stopwatch
       startTime = millis();
@@ -474,38 +463,39 @@ void loop() {
       unsigned long rollerEndMs = roller_end_time;
       unsigned long mistingStartMs = misting_start_time;
       unsigned long mistingEndMs = misting_end_time;
+      Serial.println(elapsedTime);
+      Serial.println(digitalRead(inputPin2));
 
       // printSequenceTimes(irrigationStartMs, rollerStartMs, mistingStartMs, irrigationEndMs, rollerEndMs, mistingEndMs);
-
       if (elapsedTime >= irrigationStartMs && elapsedTime < irrigationEndMs) {
           digitalWrite(relay0Pin, HIGH);
-          // Serial.println("Irrigation ON");
+          Serial.println("Irrigation ON");
       } else if (elapsedTime >= irrigationEndMs) {
           digitalWrite(relay0Pin, LOW);
-          // Serial.println("Irrigation OFF");
+          Serial.println("Irrigation OFF");
       }
 
       if (elapsedTime >= rollerStartMs && elapsedTime < rollerEndMs) {
-          // Serial.println("Roller ON (Function Call Would Happen Here)");
-          HopperMoveVelocity(user_hopper_rpm);  // Example values: 100 RPM
+          Serial.println("Roller ON (Function Call Would Happen Here)");
+          HopperMoveVelocity(user_hopper_rpm);  // Example values: 100 RPM //UNCOMMENT
 
       } else if (elapsedTime >= rollerEndMs) {
-          // Serial.println("Roller OFF");
-          HopperMoveVelocity(0);  // Example values: 100 RPM
+         Serial.println("Roller OFF");
+          HopperMoveVelocity(0);  // Example values: 100 RPM //UNCOMMENT
 
       }
 
       if (elapsedTime >= mistingStartMs && elapsedTime < mistingEndMs) {
           digitalWrite(relay1Pin, HIGH);
-          // Serial.println("Misting ON");
+          Serial.println("Misting ON");
       } else if (elapsedTime >= mistingEndMs) {
           digitalWrite(relay1Pin, LOW);
-          // Serial.println("Misting OFF");
+          Serial.println("Misting OFF");
       }
 
       if (elapsedTime >= irrigationEndMs && elapsedTime >= rollerEndMs && elapsedTime >= mistingEndMs) {
           Serial.println("Waiting for DI-7 trigger to stop belt...");
-          BeltMoveVelocity(14000);
+          // BeltMoveVelocity(14000);
 
           while (!digitalRead(inputPin2)) {
 
@@ -520,5 +510,4 @@ void loop() {
   }
   delay(10);  
 }
-
 
