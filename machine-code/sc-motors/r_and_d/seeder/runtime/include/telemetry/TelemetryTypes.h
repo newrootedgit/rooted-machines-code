@@ -5,17 +5,12 @@
 #include <string>
 #include <vector>
 
-class IAxis;
-
 enum class TelemetryEventType {
     BootStarted,
     ReadyToRunChanged,
     FaultEntered,
     FaultCleared,
     TrayCountIncremented,
-    RollerLingerStarted,
-    RollerLingerEnded,
-    RollerLingerCancelled,
     SolenoidPulseStarted,
     SolenoidPulseEnded,
 };
@@ -73,20 +68,6 @@ struct MachineSnapshot {
     std::uint64_t tray_count = 0;
 
     std::vector<MotorSnapshot> motors {};
-};
-
-struct MotorBinding {
-    std::string role = "";
-    int node_index = -1;
-    IAxis* axis = nullptr;
-};
-
-struct SeederTelemetryInputs {
-    bool ready_to_run = false;
-    int active_variety = -1;
-    int belt_speed = 0;
-    std::uint64_t tray_count = 0;
-    bool fault_latched = false;
 };
 
 #endif

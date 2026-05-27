@@ -1,0 +1,3 @@
+seeder-pi-name: superiorseeder
+seeder-user-name: rooted
+seeder-password: ck9dmt5s1

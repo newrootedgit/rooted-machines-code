@@ -1,18 +1,4 @@
 #include <Arduino.h>
-#include <Arduino.h>
-#include <SPI.h>
-#include <Ethernet.h>
-#include "ClearCore.h"
-
-#define BeltMotor ConnectorM0
-#define HopperMotor ConnectorM2
-#define INPUT_A_B_FILTER 20
-#define HANDLE_ALERTS (1)
-#define HANDLE_MOTOR_FAULTS (1)
-
-// Not connected. Select a board and a port to connect automatically.
-// Both NL & CR
-
 #include <SPI.h>
 #include <Ethernet.h>
 #include "ClearCore.h"

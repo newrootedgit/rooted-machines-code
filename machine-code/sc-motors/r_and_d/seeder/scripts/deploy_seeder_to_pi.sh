@@ -86,7 +86,7 @@ for item in "${DEPLOY_ITEMS[@]}"; do
 
   echo "Copying ${item}/"
   sshpass -p "${PI_PASSWORD}" scp \
-    -r \
+    -O -r \
     -o StrictHostKeyChecking=no \
     "${local_path}" \
     "${PI_USER}@${PI_HOST}:${REMOTE_DIR}/"

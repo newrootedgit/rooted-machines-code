@@ -21,17 +21,6 @@ struct AxisStatus {
     bool moving = false;
 };
 
-struct SafetyState {
-    bool kill_ok = false;
-    bool fault_latched = false;
-};
-
-struct PhotoeyeStatus {
-    bool blocked = false;
-    bool triggered_this_refresh = false;
-    std::uint64_t trigger_count = 0;
-};
-
 struct PresetValues {
     bool ready_to_run = false;
     int active_variety = -1;

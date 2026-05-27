@@ -17,12 +17,6 @@ static const char* telemetry_event_code_to_string(TelemetryEventType type) {
             return "FAULT_CLEARED";
         case TelemetryEventType::TrayCountIncremented:
             return "TRAY_COUNT_INCREMENTED";
-        case TelemetryEventType::RollerLingerStarted:
-            return "ROLLER_LINGER_STARTED";
-        case TelemetryEventType::RollerLingerEnded:
-            return "ROLLER_LINGER_ENDED";
-        case TelemetryEventType::RollerLingerCancelled:
-            return "ROLLER_LINGER_CANCELLED";
         case TelemetryEventType::SolenoidPulseStarted:
             return "SOLENOID_PULSE_STARTED";
         case TelemetryEventType::SolenoidPulseEnded:

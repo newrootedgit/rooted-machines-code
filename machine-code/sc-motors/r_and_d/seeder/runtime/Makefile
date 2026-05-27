@@ -16,10 +16,7 @@ SRCS = $(SRC_DIR)/main.cpp \
        $(SRC_DIR)/utils/ClearCoreClient.cpp \
        $(SRC_DIR)/utils/Axis.cpp \
        $(SRC_DIR)/utils/JsonlTelemetryLogger.cpp \
-       $(SRC_DIR)/utils/SafetySupervisor.cpp \
        $(SRC_DIR)/utils/TouchEncoderState.cpp \
-       $(SRC_DIR)/utils/Input.cpp \
-       $(SRC_DIR)/utils/SCNodeInput.cpp \
        $(SRC_DIR)/utils/SCBrakeOutput.cpp
 
 TARGET = seeder_test

@@ -66,6 +66,7 @@ def load_state() -> Dict:
 
     ready_to_run = int(bool(data.get("ready_to_run", False)))
     active_variety = data.get("active_variety", None)
+    variety_names = data.get("variety_names", {})
 
     # Default values if nothing is set yet
     variety_values = {
@@ -79,6 +80,7 @@ def load_state() -> Dict:
         "roller_duration": 0,
     }
 
+    variety_name = ""
     if active_variety is not None:
         key = str(active_variety)
         v = data.get(key, {})
@@ -88,8 +90,19 @@ def load_state() -> Dict:
                     variety_values[k] = int(v.get(k, 0))
                 except (TypeError, ValueError):
                     variety_values[k] = 0
+        # Look up the human-readable name from variety_names map.
+        if isinstance(variety_names, dict):
+            variety_name = str(variety_names.get(key, ""))
     else:
         active_variety = -1  # sentinel for "no active variety"
+
+    # Sanitize for the downstream CSV/UDP pipeline:
+    # - strip commas/newlines so they can't fragment the ClearCore parser
+    #   (which uses strtok(",")) or the telemetry UDP packet
+    # - cap at 32 chars to match the ClearCore-side buffer
+    variety_name = (
+        variety_name.replace(",", "_").replace("\n", "_").replace("\r", "_")[:32]
+    )
 
     return {
         "ready_to_run": ready_to_run,
@@ -102,6 +115,7 @@ def load_state() -> Dict:
         "misting_duration": variety_values["misting_duration"],
         "roller_delay": variety_values["roller_delay"],
         "roller_duration": variety_values["roller_duration"],
+        "variety_name": variety_name,
     }
 
 def serve():
@@ -118,7 +132,9 @@ def serve():
                 try:
                     state = load_state()
 
-                    # CSV payload in a fixed order for ClearCore or other client
+                    # CSV payload in a fixed order for ClearCore or other client.
+                    # variety_name is last (field 10) so any future overflow
+                    # truncation chops the name, not the structured numeric tail.
                     payload_fields = [
                         state["ready_to_run"],
                         state["active_variety"],
@@ -130,6 +146,7 @@ def serve():
                         state["misting_duration"],
                         state["roller_delay"],
                         state["roller_duration"],
+                        state["variety_name"],
                     ]
                     payload = ",".join(str(x) for x in payload_fields)
 
