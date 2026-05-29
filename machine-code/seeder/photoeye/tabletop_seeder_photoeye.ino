@@ -78,7 +78,7 @@ struct TelemetryState {
     bool     lastHopperFault;
     uint32_t beltMotorUptimeMs;   // millis() when belt started moving (0 = idle)
     uint32_t hopperMotorUptimeMs; // millis() when hopper started moving (0 = idle)
-    uint32_t sequenceCount;       // number of completed sequences since boot
+    uint32_t traysProcessed;       // number of completed sequences since boot
 };
 TelemetryState t;
 
@@ -370,7 +370,7 @@ void SendStatusUpdate() {
              (unsigned long)hopperUptime,
              (unsigned long)cmdAgeMs,
              (unsigned long)t.udpSendFailCount,
-             (unsigned long)t.sequenceCount,
+             (unsigned long)t.traysProcessed,
              activeVarietyId,
              activeVarietyName);
 
@@ -489,7 +489,7 @@ void setup() {
     t.lastHopperFault     = false;
     t.beltMotorUptimeMs   = 0;
     t.hopperMotorUptimeMs = 0;
-    t.sequenceCount       = 0;
+    t.traysProcessed       = 0;
 
     Udp.begin(UDP_LOCAL_PORT);
     Serial.println("UDP telemetry initialized");
@@ -629,7 +629,7 @@ void loop() {
 
       if (elapsedTime >= irrigationEndMs && elapsedTime >= rollerEndMs && elapsedTime >= mistingEndMs) {
           sequenceActive = false;
-          t.sequenceCount++;
+          t.traysProcessed++;
       }
   }
 

@@ -54,12 +54,9 @@ char activeVarietyName[33] = "";
 // ---- Debug logging ----
 // When true, verbose per-cycle / per-packet diagnostic prints are emitted.
 // Error and important state messages are always printed regardless.
-// NOTE: do NOT name this `DEBUG` — the ClearCore SAM toolchain defines
-// `DEBUG` as a numeric macro on the compiler command line, which would expand
-// here and break the build ("expected unqualified-id before numeric constant").
-const bool DEBUG_LOG = false;
-#define DBG_PRINT(x)   do { if (DEBUG_LOG) Serial.print(x); } while (0)
-#define DBG_PRINTLN(x) do { if (DEBUG_LOG) Serial.println(x); } while (0)
+const bool DEBUG = false;
+#define DBG_PRINT(x)   do { if (DEBUG) Serial.print(x); } while (0)
+#define DBG_PRINTLN(x) do { if (DEBUG) Serial.println(x); } while (0)
 
 // ---- UDP telemetry ----
 // Telemetry uses a SEPARATE UDP socket from the TCP control channel to avoid
@@ -81,7 +78,7 @@ struct TelemetryState {
     bool     lastHopperFault;
     uint32_t beltMotorUptimeMs;   // millis() when belt started moving (0 = idle)
     uint32_t hopperMotorUptimeMs; // millis() when hopper started moving (0 = idle)
-    uint32_t sequenceCount;       // number of completed sequences since boot
+    uint32_t traysProcessed;       // number of completed sequences since boot
 };
 TelemetryState t;
 
@@ -118,7 +115,7 @@ bool BeltMoveVelocity(int velocity) {
     if (BeltMotor.StatusReg().bit.AlertsPresent) {
         Serial.println("Motor alert detected.");
         PrintAlerts();
-        SendEvent("BELT_FAULT", (int32_t)EncodeBeltAlerts());
+        SendEvent("FAULT_BELT", "belt");
         t.faultCountBelt++;
         if(HANDLE_ALERTS){
             HandleAlerts();
@@ -150,7 +147,7 @@ bool HopperMoveVelocity(int velocity) {
     if (HopperMotor.StatusReg().bit.AlertsPresent) {
         Serial.println("Motor alert detected.");
         PrintAlerts();
-        SendEvent("HOPPER_FAULT", (int32_t)EncodeHopperAlerts());
+        SendEvent("FAULT_ROLLER", "roller");
         t.faultCountHopper++;
         if(HANDLE_ALERTS){
             HandleAlerts();
@@ -294,29 +291,6 @@ void parseReceivedMessage(char *message) {
     
 }
 
-// Pack the six alert-register bits into a uint16_t for compact telemetry.
-static uint16_t EncodeBeltAlerts() {
-    uint16_t bits = 0;
-    bits |= BeltMotor.AlertReg().bit.MotionCanceledInAlert       ? (1 << 0) : 0;
-    bits |= BeltMotor.AlertReg().bit.MotionCanceledPositiveLimit ? (1 << 1) : 0;
-    bits |= BeltMotor.AlertReg().bit.MotionCanceledNegativeLimit ? (1 << 2) : 0;
-    bits |= BeltMotor.AlertReg().bit.MotionCanceledSensorEStop   ? (1 << 3) : 0;
-    bits |= BeltMotor.AlertReg().bit.MotionCanceledMotorDisabled ? (1 << 4) : 0;
-    bits |= BeltMotor.AlertReg().bit.MotorFaulted                ? (1 << 5) : 0;
-    return bits;
-}
-
-static uint16_t EncodeHopperAlerts() {
-    uint16_t bits = 0;
-    bits |= HopperMotor.AlertReg().bit.MotionCanceledInAlert       ? (1 << 0) : 0;
-    bits |= HopperMotor.AlertReg().bit.MotionCanceledPositiveLimit ? (1 << 1) : 0;
-    bits |= HopperMotor.AlertReg().bit.MotionCanceledNegativeLimit ? (1 << 2) : 0;
-    bits |= HopperMotor.AlertReg().bit.MotionCanceledSensorEStop   ? (1 << 3) : 0;
-    bits |= HopperMotor.AlertReg().bit.MotionCanceledMotorDisabled ? (1 << 4) : 0;
-    bits |= HopperMotor.AlertReg().bit.MotorFaulted                ? (1 << 5) : 0;
-    return bits;
-}
-
 void PrintAlerts() {
     Serial.println("Alerts present: ");
     if(BeltMotor.AlertReg().bit.MotionCanceledInAlert){
@@ -375,44 +349,28 @@ void SendStatusUpdate() {
     }
     char telemetryBuffer[256];
     uint32_t uptimeMs = millis();
-    bool beltFault    = BeltMotor.StatusReg().bit.AlertsPresent;
-    bool hopperFault  = HopperMotor.StatusReg().bit.AlertsPresent;
-    uint16_t beltAlertBits   = EncodeBeltAlerts();
-    uint16_t hopperAlertBits = EncodeHopperAlerts();
-    int di6 = digitalRead(inputPin1) ? 1 : 0;
-    int rel0 = digitalRead(relay0Pin) ? 1 : 0;
-    int rel1 = digitalRead(relay1Pin) ? 1 : 0;
     uint32_t cmdAgeMs = uptimeMs - t.lastRxCmdMs;
     uint32_t seq = ++t.seq;
 
     uint32_t beltUptime   = t.beltMotorUptimeMs   ? (uptimeMs - t.beltMotorUptimeMs)   : 0;
     uint32_t hopperUptime = t.hopperMotorUptimeMs ? (uptimeMs - t.hopperMotorUptimeMs) : 0;
 
-    // Format: STATUS_UPDATE,ver,bootId,seq,uptimeMs,beltUptime,hopperUptime,
-    //         beltFault,hopperFault,beltAlerts,hopperAlerts,sequenceActive,
-    //         readyToRun,beltRpm,hopperRpm,di6,rel0,rel1,cmdAgeMs,
-    //         udpFails,sequenceCount,varietyId,varietyName
+    // Format (schema_ver 2): STATUS_UPDATE,2,bootId,seq,uptimeMs,
+    //   belt_motor_uptime_ms,roller_motor_uptime_ms,cmdAgeMs,udpFails,
+    //   trays_processed,varietyId,varietyName
+    // hopperUptime maps to roller_motor_uptime_ms (hopper = roller).
     // varietyName is LAST so any snprintf truncation chops the name, not
     // the structured numeric tail.
     snprintf(telemetryBuffer, sizeof(telemetryBuffer),
-             "STATUS_UPDATE,1,%lu,%lu,%lu,%lu,%lu,%d,%d,%u,%u,%d,%d,%d,%d,%d,%d,%d,%lu,%lu,%lu,%d,%s",
+             "STATUS_UPDATE,2,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%d,%s",
              (unsigned long)t.bootId,
              (unsigned long)seq,
              (unsigned long)uptimeMs,
              (unsigned long)beltUptime,
              (unsigned long)hopperUptime,
-             beltFault ? 1 : 0,
-             hopperFault ? 1 : 0,
-             (unsigned int)beltAlertBits,
-             (unsigned int)hopperAlertBits,
-             sequenceActive ? 1 : 0,
-             ready_to_run_flag ? 1 : 0,
-             (int)user_belt_rpm,
-             (int)user_hopper_rpm,
-             di6, rel0, rel1,
              (unsigned long)cmdAgeMs,
              (unsigned long)t.udpSendFailCount,
-             (unsigned long)t.sequenceCount,
+             (unsigned long)t.traysProcessed,
              activeVarietyId,
              activeVarietyName);
 
@@ -423,11 +381,11 @@ void SendStatusUpdate() {
     }
 }
 
-// Lightweight event ping — only used for faults and timeouts.
-// Motor/source identity goes in the eventCode string (e.g. "BELT_FAULT",
-// "HOPPER_FAULT"). Receiver can join with nearest STATUS_UPDATE on
-// (bootId, uptimeMs) for full state at event time.
-void SendEvent(const char *eventCode, int32_t value) {
+// Lightweight fault ping — emit once on the fault edge (0->1), not every
+// cycle. Receiver joins with the nearest STATUS_UPDATE on (bootId, uptimeMs)
+// for full state at event time. eventCode must start with "FAULT_"; motor
+// attributes the fault ("belt" or "roller").
+void SendEvent(const char *eventCode, const char *motor) {
     if (Ethernet.linkStatus() != LinkON) {
         return;
     }
@@ -435,15 +393,15 @@ void SendEvent(const char *eventCode, int32_t value) {
     uint32_t uptimeMs = millis();
     uint32_t seq = ++t.seq;
 
-    // Format: EVENT,ver,bootId,seq,uptimeMs,eventCode,value,udpFails
+    // Format (schema_ver 2): EVENT,2,bootId,seq,uptimeMs,eventCode,eventValue,motor
     snprintf(telemetryBuffer, sizeof(telemetryBuffer),
-             "EVENT,1,%lu,%lu,%lu,%s,%ld,%lu",
+             "EVENT,2,%lu,%lu,%lu,%s,%d,%s",
              (unsigned long)t.bootId,
              (unsigned long)seq,
              (unsigned long)uptimeMs,
              eventCode,
-             (long)value,
-             (unsigned long)t.udpSendFailCount);
+             1,
+             motor);
 
     Udp.beginPacket(serverIp, remotePort);
     Udp.write((const uint8_t *)telemetryBuffer, strlen(telemetryBuffer));
@@ -531,7 +489,7 @@ void setup() {
     t.lastHopperFault     = false;
     t.beltMotorUptimeMs   = 0;
     t.hopperMotorUptimeMs = 0;
-    t.sequenceCount       = 0;
+    t.traysProcessed       = 0;
 
     Udp.begin(UDP_LOCAL_PORT);
     Serial.println("UDP telemetry initialized");
@@ -671,7 +629,7 @@ void loop() {
 
       if (elapsedTime >= irrigationEndMs && elapsedTime >= rollerEndMs && elapsedTime >= mistingEndMs) {
           sequenceActive = false;
-          t.sequenceCount++;
+          t.traysProcessed++;
       }
   }
 
