@@ -16,6 +16,11 @@ from te.utils.discovery_tool import pprint_discover_tes
 JSON_FILE_PATH = "/home/rooted/te-cli/TE_Variable_Values.json"
 LOCK_FILE_PATH = JSON_FILE_PATH + ".lock"
 POLL_INTERVAL_SEC = 0.3  # matches original monitor loop cadence
+NUM_VARIETIES = 20       # total variety slots (1-20)
+
+# Variety name display on Touch Encoder
+VARIETY_NAME_SCREEN = 10   # Operator variety selection screen
+VARIETY_NAME_VAR = 7       # VariableID for the name string on screen 10
 
 # Recovery strategy:
 #   "reconnect" (default) -> self-heal in-process by rediscovering the encoder
@@ -60,6 +65,7 @@ def ensure_json_exists(path: str):
       {
         "ready_to_run": false,
         "active_variety": null,
+        "variety_names": { "1": "...", "2": "...", ... },
         "1": { ... variety 1 data ... },
         "2": { ... variety 2 data ... },
         ...
@@ -69,10 +75,12 @@ def ensure_json_exists(path: str):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with FileLock(LOCK_FILE_PATH, shared=False):
             if not os.path.exists(path):
+                default_names = {str(i): str(i) for i in range(1, NUM_VARIETIES + 1)}
                 with open(path, "w") as f:
                     json.dump({
                         "ready_to_run": False,
-                        "active_variety": None
+                        "active_variety": None,
+                        "variety_names": default_names,
                     }, f, indent=4)
 
 def locked_read_json(path: str) -> Dict:
@@ -236,6 +244,26 @@ def ready_to_run_toggle(flag: bool):
     locked_atomic_write_json(JSON_FILE_PATH, data)
     print(f"ready_to_run set to {bool(flag)}")
 
+def get_variety_name(variety_index: int) -> str:
+    """Look up the display name for a variety index from JSON."""
+    data = locked_read_json(JSON_FILE_PATH) or {}
+    names = data.get("variety_names", {})
+    return names.get(str(int(variety_index)), str(variety_index))
+
+def write_variety_to_screen(variety_index: int, screen_id: int = VARIETY_NAME_SCREEN, var_id: int = VARIETY_NAME_VAR):
+    """Write the variety name string to a TE screen variable."""
+    global te
+    name = get_variety_name(variety_index)
+    try:
+        te.guide.set_var(
+            ScreenID(screen_id),
+            VariableID(var_id),
+            VariableData(name),
+        )
+        print(f"Variety display s{screen_id}v{var_id}: [{variety_index}/{NUM_VARIETIES}] {name}")
+    except Exception as e:
+        print(f"ERROR: writing variety name to s{screen_id}v{var_id}: {e}")
+
 def restore_vars_if_reset():
     """
     After reconnect (or process restart), push the last active variety's values
@@ -254,6 +282,8 @@ def restore_vars_if_reset():
         return
 
     print(f"restore_vars_if_reset: restoring values for variety {key}")
+    set_variable(VARIETY_NAME_SCREEN, 1, active_variety)  # restore selection index
+    write_variety_to_screen(active_variety)               # restore name on screen 10
     set_variable(6, 1, v.get("roller_speed", 0))        # Roller Speed
     set_variable(3, 1, v.get("belt_speed", 0))          # Belt Speed
     set_variable(11, 1, v.get("irrigation_delay", 0))   # Irrigation Delay
@@ -286,13 +316,28 @@ def monitor_touch_encoder_loop():
     # Return to variety selection screen
     try:
         global te
+        # Write variety name before navigating to prevent flash of default string
+        write_variety_to_screen(1)
         te.guide.set_screen(ScreenID(10))
     except Exception as e:
         print(f"Error setting initial screen 10: {e}")
 
+    # Track the last index we wrote a name for, so we only push on change
+    last_shown_index = None
+
     while True:
         # Get current screen (with retries)
         active_screen = safe_get_screen()
+
+        # On the selection screen, the encoder scrolls its own numeric variable
+        # (screen 10 / var 1). Mirror that selection to the name string (var 7).
+        if active_screen == ScreenID(VARIETY_NAME_SCREEN):
+            sel = get_variable(VARIETY_NAME_SCREEN, 1)
+            if sel is not None and sel != last_shown_index:
+                write_variety_to_screen(sel)
+                last_shown_index = sel
+        else:
+            last_shown_index = None
 
         # -----------------------------
         # Screen 9: Save Confirmation
@@ -343,8 +388,8 @@ def monitor_touch_encoder_loop():
             save_active_variety(variety_index)  # Save active variety to JSON
 
             saved_data = load_variety_data()
-            # Display which variety is loaded on screen 18
-            set_variable(18, 2, variety_index)
+            # Display which variety is loaded on screen 18 (show its name)
+            write_variety_to_screen(variety_index, 18, 2)
 
             key = str(variety_index)
             if key in saved_data and isinstance(saved_data[key], dict):
@@ -399,6 +444,8 @@ def main():
             if te is None and RECOVERY_MODE != "restart":
                 te = discover_te_blocking()
                 try:
+                    # Write variety name before navigating to prevent flash of default string
+                    write_variety_to_screen(1)
                     te.guide.set_screen(ScreenID(10))
                 except Exception:
                     pass
