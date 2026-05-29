@@ -54,9 +54,12 @@ char activeVarietyName[33] = "";
 // ---- Debug logging ----
 // When true, verbose per-cycle / per-packet diagnostic prints are emitted.
 // Error and important state messages are always printed regardless.
-const bool DEBUG = false;
-#define DBG_PRINT(x)   do { if (DEBUG) Serial.print(x); } while (0)
-#define DBG_PRINTLN(x) do { if (DEBUG) Serial.println(x); } while (0)
+// NOTE: do NOT name this `DEBUG` — the ClearCore SAM toolchain defines
+// `DEBUG` as a numeric macro on the compiler command line, which would expand
+// here and break the build ("expected unqualified-id before numeric constant").
+const bool DEBUG_LOG = true;
+#define DBG_PRINT(x)   do { if (DEBUG_LOG) Serial.print(x); } while (0)
+#define DBG_PRINTLN(x) do { if (DEBUG_LOG) Serial.println(x); } while (0)
 
 // ---- UDP telemetry ----
 // Telemetry uses a SEPARATE UDP socket from the TCP control channel to avoid
@@ -428,11 +431,12 @@ void setup() {
         delay(1000);
     }
 
+    Serial.println("[line-framed-v2] firmware boot");
     if (client.connect(serverIp, PORT_NUM)) {
         Serial.println("Connected to server.");
     } else {
         Serial.println("Failed to connect to server.");
-    }  
+    }
 
     /////////////////////////////////////////////////////////
     /////////////        Motor Set Up           /////////////
@@ -507,11 +511,39 @@ void loop() {
           client.stop();
           client.connect(serverIp, PORT_NUM);
       }
-  } else if (client.available() > 0) {
-      int len = client.read(packetReceived, MAX_PACKET_LENGTH - 1);
-      if (len > 0) {
-          packetReceived[len] = '\0';
-          parseReceivedMessage((char *)packetReceived);
+  } else {
+      // The Pi server holds the connection open and pushes a newline-terminated
+      // CSV whenever state changes, plus a periodic heartbeat (~10s). Frame on
+      // '\n' so multi-packet or split reads don't corrupt the CSV field split,
+      // and skip-parse if the snapshot matches the last one we parsed — that
+      // makes the heartbeat free and gives us defense-in-depth against any
+      // future server that pushes redundant updates.
+      static char   lineBuf[MAX_PACKET_LENGTH];
+      static char   lastLine[MAX_PACKET_LENGTH];  // zero-init by static
+      static size_t lineLen = 0;
+      while (client.available() > 0) {
+          int c = client.read();
+          if (c < 0) break;
+          if (c == '\r') continue;                       // tolerate CRLF
+          if (c == '\n') {
+              if (lineLen > 0) {
+                  lineBuf[lineLen] = '\0';
+                  if (strcmp(lineBuf, lastLine) != 0) {
+                      // Cache BEFORE parse — parseReceivedMessage uses strtok
+                      // which mutates lineBuf in place.
+                      memcpy(lastLine, lineBuf, lineLen + 1);
+                      parseReceivedMessage(lineBuf);
+                  }
+              }
+              lineLen = 0;
+          } else if (lineLen < sizeof(lineBuf) - 1) {
+              lineBuf[lineLen++] = (char)c;
+          } else {
+              // Overflow without a delimiter — drop the partial line and
+              // resync on the next '\n'. Should never happen with the current
+              // ~80-byte payload.
+              lineLen = 0;
+          }
       }
   }
 

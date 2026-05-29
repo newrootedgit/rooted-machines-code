@@ -3,6 +3,7 @@ import os
 import json
 import socket
 import fcntl
+import time
 from typing import Dict
 
 # ========================
@@ -12,6 +13,17 @@ HOST = "192.168.10.1"   # As confirmed
 PORT = 8888
 JSON_FILE_PATH = "/home/rooted/te-cli/TE_Variable_Values.json"
 LOCK_FILE_PATH = JSON_FILE_PATH + ".lock"
+
+# Tick rate at which we re-read the shared JSON and check whether the rendered
+# payload has changed. This is the upper bound on how stale ready_to_run /
+# variety params can be on the motor side when something *does* change.
+POLL_INTERVAL_S = 0.5
+
+# Send a refresh even if the payload hasn't changed, at least this often. Gives
+# the ClearCore (or a fresh reconnect) a recent snapshot without relying on
+# the next user action, and lets us layer on a deadman timeout later if we
+# want fail-safe behavior on the motor side.
+HEARTBEAT_INTERVAL_S = 10.0
 
 # ========================
 # Lock helpers (advisory)
@@ -118,50 +130,90 @@ def load_state() -> Dict:
         "variety_name": variety_name,
     }
 
+def build_payload() -> str:
+    """Render the current shared state as a single CSV line (no trailing \\n)."""
+    state = load_state()
+    # Field order is the contract with the ClearCore parser. variety_name is
+    # last so any future overflow truncation chops the name, not the structured
+    # numeric tail.
+    payload_fields = [
+        state["ready_to_run"],
+        state["active_variety"],
+        state["roller_speed"],
+        state["belt_speed"],
+        state["irrigation_delay"],
+        state["irrigation_duration"],
+        state["misting_delay"],
+        state["misting_duration"],
+        state["roller_delay"],
+        state["roller_duration"],
+        state["variety_name"],
+    ]
+    return ",".join(str(x) for x in payload_fields)
+
+
+def serve_client(conn: socket.socket, addr) -> None:
+    """
+    Hold the connection open and push a newline-terminated CSV snapshot
+    whenever the rendered payload changes, plus a heartbeat refresh every
+    HEARTBEAT_INTERVAL_S. Returns on disconnect.
+    """
+    # Detect a dead peer reasonably quickly without blocking on send.
+    conn.settimeout(5.0)
+    # Disable Nagle so sub-100-byte updates ship immediately.
+    try:
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
+
+    print(f"tcp: [persistent-v2] client connected {addr}")
+    last_sent: str | None = None
+    last_sent_at = 0.0
+    try:
+        while True:
+            try:
+                payload = build_payload()
+            except Exception as e:
+                # Transient JSON read race — log and retry on the next tick.
+                print(f"tcp: payload error for {addr}: {e}")
+                time.sleep(POLL_INTERVAL_S)
+                continue
+
+            now = time.monotonic()
+            changed   = (payload != last_sent)
+            heartbeat = (now - last_sent_at) >= HEARTBEAT_INTERVAL_S
+            if changed or heartbeat:
+                try:
+                    conn.sendall((payload + "\n").encode("utf-8"))
+                except (BrokenPipeError, ConnectionResetError, socket.timeout, OSError) as e:
+                    print(f"tcp: client {addr} disconnected: {e}")
+                    return
+                if changed:
+                    print(f"tcp: {addr} <- '{payload}'")
+                last_sent = payload
+                last_sent_at = now
+            time.sleep(POLL_INTERVAL_S)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def serve():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         # Allow quick restart after crash
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind((HOST, PORT))
         s.listen(5)
-        print(f"tcp: serving on {HOST}:{PORT}")
+        print(f"tcp: [persistent-v2] serving on {HOST}:{PORT}")
 
         while True:
             conn, addr = s.accept()
-            with conn:
-                try:
-                    state = load_state()
-
-                    # CSV payload in a fixed order for ClearCore or other client.
-                    # variety_name is last (field 10) so any future overflow
-                    # truncation chops the name, not the structured numeric tail.
-                    payload_fields = [
-                        state["ready_to_run"],
-                        state["active_variety"],
-                        state["roller_speed"],
-                        state["belt_speed"],
-                        state["irrigation_delay"],
-                        state["irrigation_duration"],
-                        state["misting_delay"],
-                        state["misting_duration"],
-                        state["roller_delay"],
-                        state["roller_duration"],
-                        state["variety_name"],
-                    ]
-                    payload = ",".join(str(x) for x in payload_fields)
-
-                    conn.sendall(payload.encode("utf-8"))
-                    # Optional: add newline if client expects it
-                    # conn.sendall(b"\n")
-
-                    print(f"tcp: {addr} -> '{payload}'")
-
-                except Exception as e:
-                    try:
-                        conn.sendall(b"ERR")
-                    except Exception:
-                        pass
-                    print(f"tcp: error serving {addr}: {e}")
+            # One client at a time matches the ClearCore deployment (single
+            # motor controller). If a second client connects, finish serving
+            # the current one first.
+            serve_client(conn, addr)
 
 if __name__ == "__main__":
     serve()
