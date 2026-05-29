@@ -10,8 +10,7 @@
 
 int accelerationLimit = 100000; // pulses per sec^2
 
-#define inputPin1 IO3  // Belt Start trigger
-#define inputPin2 IO2  // Belt Reset trigger
+#define inputPin1 IO3  // Tray photoeye
 
 #define relay0Pin IO0 // Irrigation output
 #define relay1Pin IO1 // Misting output
@@ -58,15 +57,6 @@ char activeVarietyName[33] = "";
 const bool DEBUG = false;
 #define DBG_PRINT(x)   do { if (DEBUG) Serial.print(x); } while (0)
 #define DBG_PRINTLN(x) do { if (DEBUG) Serial.println(x); } while (0)
-
-// ---- Belt eject configuration ----
-// After the sequence completes, the belt can run at a faster "eject" speed
-// until the reset photoeye (DI-7 / inputPin2) triggers, pushing the tray
-// off the line. Set BELT_EJECT_ENABLED = false to skip eject entirely
-// (belt stops immediately at sequence end, no DI-7 wait).
-const bool          BELT_EJECT_ENABLED      = true;
-const int           BELT_EJECT_VELOCITY     = 14000;
-const unsigned long BELT_EJECT_TIMEOUT_MS   = 60000; // safety cap on DI-7 wait
 
 // ---- UDP telemetry ----
 // Telemetry uses a SEPARATE UDP socket from the TCP control channel to avoid
@@ -424,7 +414,6 @@ void setup() {
     pinMode(relay0Pin, OUTPUT);
     pinMode(relay1Pin, OUTPUT);
     pinMode(inputPin1, INPUT);
-    pinMode(inputPin2, INPUT);
 
 
     Serial.begin(9600);
@@ -527,6 +516,30 @@ void loop() {
   }
 
   ////////////////////////////////////////////////////////////
+  //////////////// Belt Run Gate //////////////////////////////
+  ////////////////////////////////////////////////////////////
+  // Belt runs continuously while ready_to_run_flag is true. Only re-issue
+  // the velocity command when something actually changed (flag flip or
+  // live RPM update) so we don't spam the motor every tick.
+  {
+      static bool  lastBeltRunning   = false;
+      static float lastCommandedRpm  = 0;
+      bool wantBeltRunning = ready_to_run_flag && (user_belt_rpm > 0);
+
+      if (wantBeltRunning) {
+          if (!lastBeltRunning || user_belt_rpm != lastCommandedRpm) {
+              BeltMoveVelocity(user_belt_rpm);
+              lastCommandedRpm = user_belt_rpm;
+              lastBeltRunning  = true;
+          }
+      } else if (lastBeltRunning) {
+          BeltMoveVelocity(0);
+          lastCommandedRpm = 0;
+          lastBeltRunning  = false;
+      }
+  }
+
+  ////////////////////////////////////////////////////////////
   //////////////// Calculate Motor Speed //////////////////////
   ////////////////////////////////////////////////////////////
 
@@ -564,18 +577,18 @@ void loop() {
   ////////////////////////////////////////////////////////////
 
   bool inputState = digitalRead(inputPin1);
+  static bool lastPhotoeyeState = false;
 
-  // Refuse to start a sequence without a valid belt speed — running with a
-  // clamped/zero speed produces nonsense timings.
-  if (inputState && !sequenceActive && ready_to_run_flag && belt_speed_valid) {
-      // If DI-6 is triggered and sequence is not already running, start stopwatch
+  // Rising-edge only: a tray that's still parked in front of the photoeye
+  // when the previous sequence ends must not immediately re-fire — wait for
+  // it to clear and a new tray to arrive. Refuse to start without a valid
+  // belt speed (clamped/zero speed produces nonsense timings).
+  if (inputState && !lastPhotoeyeState && !sequenceActive && ready_to_run_flag && belt_speed_valid) {
       startTime = millis();
       sequenceActive = true;
-      DBG_PRINTLN("DI-6 triggered: Starting event sequence.");
-
-      // Run belt motor immediately
-      BeltMoveVelocity(user_belt_rpm);  // Example values: 100 RPM
+      DBG_PRINTLN("Photoeye rising edge: Starting event sequence.");
   }
+  lastPhotoeyeState = inputState;
 
   if (sequenceActive) {
       unsigned long elapsedTime = millis() - startTime;
@@ -615,25 +628,6 @@ void loop() {
       }
 
       if (elapsedTime >= irrigationEndMs && elapsedTime >= rollerEndMs && elapsedTime >= mistingEndMs) {
-          if (BELT_EJECT_ENABLED) {
-              DBG_PRINTLN("Waiting for DI-7 trigger to stop belt...");
-              BeltMoveVelocity(BELT_EJECT_VELOCITY);
-
-              unsigned long ejectStart = millis();
-              bool resetTriggered = false;
-              while (millis() - ejectStart < BELT_EJECT_TIMEOUT_MS) {
-                  if (digitalRead(inputPin2)) { resetTriggered = true; break; }
-                  delay(10);
-              }
-              if (!resetTriggered) {
-                  Serial.println("WARNING: DI-7 timeout — stopping belt anyway.");
-                  SendEvent("DI7_TIMEOUT", (int32_t)(millis() - ejectStart));
-              }
-              delay(500);
-          } else {
-              DBG_PRINTLN("Belt eject disabled — stopping at sequence end.");
-          }
-          BeltMoveVelocity(0);
           sequenceActive = false;
           t.sequenceCount++;
       }
