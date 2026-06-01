@@ -80,7 +80,8 @@ struct TelemetryState {
     bool     lastBeltFault;
     bool     lastHopperFault;
     uint32_t beltMotorUptimeMs;   // millis() when belt started moving (0 = idle)
-    uint32_t hopperMotorUptimeMs; // millis() when hopper started moving (0 = idle)
+    uint32_t hopperMotorUptimeMs; // cumulative roller run time since boot, accrued
+                                  // deterministically from each commanded run window
     uint32_t traysProcessed;       // number of completed sequences since boot
 };
 TelemetryState t;
@@ -163,12 +164,11 @@ bool HopperMoveVelocity(int velocity) {
     // Non-blocking: command the velocity and return. Busy-waiting on
     // AtTargetVelocity here would stall loop() and skew sequence timing,
     // especially when ramping down to 0 at roller-end.
+    // NOTE: roller run time is NOT tracked here. Because the roller runs in
+    // short bursts between telemetry samples, reading elapsed-since-start almost
+    // always caught it idle. Instead we accrue the deterministic run window
+    // (rollerEnd - rollerStart) once per sequence where the roller commits.
     HopperMotor.MoveVelocity(HOPPER_VELOCITY_GAIN * velocity);
-    if (velocity == 0) {
-        t.hopperMotorUptimeMs = 0;
-    } else if (t.hopperMotorUptimeMs == 0) {
-        t.hopperMotorUptimeMs = millis();
-    }
     return true;
 }
 
@@ -355,13 +355,15 @@ void SendStatusUpdate() {
     uint32_t cmdAgeMs = uptimeMs - t.lastRxCmdMs;
     uint32_t seq = ++t.seq;
 
-    uint32_t beltUptime   = t.beltMotorUptimeMs   ? (uptimeMs - t.beltMotorUptimeMs)   : 0;
-    uint32_t hopperUptime = t.hopperMotorUptimeMs ? (uptimeMs - t.hopperMotorUptimeMs) : 0;
+    uint32_t beltUptime   = t.beltMotorUptimeMs ? (uptimeMs - t.beltMotorUptimeMs) : 0;
+    uint32_t hopperUptime = t.hopperMotorUptimeMs; // cumulative deterministic roller run time
 
     // Format (schema_ver 2): STATUS_UPDATE,2,bootId,seq,uptimeMs,
     //   belt_motor_uptime_ms,roller_motor_uptime_ms,cmdAgeMs,udpFails,
     //   trays_processed,varietyId,varietyName
-    // hopperUptime maps to roller_motor_uptime_ms (hopper = roller).
+    // hopperUptime maps to roller_motor_uptime_ms (hopper = roller). Unlike the
+    // belt (continuous, reported as current run duration), the roller value is
+    // a cumulative total of commanded run windows since boot.
     // varietyName is LAST so any snprintf truncation chops the name, not
     // the structured numeric tail.
     snprintf(telemetryBuffer, sizeof(telemetryBuffer),
@@ -689,7 +691,14 @@ void loop() {
           if (!rollerGateEvaluated) {
               rollerGateEvaluated = true;
               rollerAllowed = inputState;
-              if (!rollerAllowed) {
+              if (rollerAllowed) {
+                  // Accrue the deterministic run window once, here at commit.
+                  // The roller runs rollerStart..rollerEnd unconditionally from
+                  // this point, so this equals the actual run time.
+                  if (rollerEndMs > rollerStartMs) {
+                      t.hopperMotorUptimeMs += (uint32_t)(rollerEndMs - rollerStartMs);
+                  }
+              } else {
                   DBG_PRINTLN("Roller suppressed: photoeye cleared before roller-start (likely false trigger).");
               }
           }
