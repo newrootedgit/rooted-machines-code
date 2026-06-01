@@ -22,6 +22,15 @@ NUM_VARIETIES = 20       # total variety slots (1-20)
 VARIETY_NAME_SCREEN = 10   # Operator variety selection screen
 VARIETY_NAME_VAR = 7       # VariableID for the name string on screen 10
 
+# Machine state screen (status display + start/stop button)
+STATE_SCREEN = 19
+STATE_STATUS_VAR    = 1  # "Running" / "Stopped"
+STATE_PRESET_VAR    = 2  # selected preset name
+STATE_BTN_TEXT_VAR  = 3  # "Start Machine" / "Stop Machine" (dynamic button image)
+# Button 1 in GUIDE is configured with Action="Set value" -> writes 1 into
+# this Value ID. Poll detects nonzero, toggles ready_to_run, writes 0 back.
+STATE_BTN_PRESS_VAR = 4
+
 # Recovery strategy:
 #   "reconnect" (default) -> self-heal in-process by rediscovering the encoder
 #   "restart"             -> exit(42); let systemd restart the process (fresh venv/python)
@@ -191,6 +200,16 @@ def set_variable(screen_id: int, var_id: int, value: int) -> bool:
 def get_variable(screen_id: int, var_id: int) -> int:
     return safe_get_var(screen_id, var_id)
 
+def set_string_var(screen_id: int, var_id: int, value: str) -> bool:
+    """Write a string variable to the encoder (no read-back verify)."""
+    global te
+    try:
+        te.guide.set_var(ScreenID(screen_id), VariableID(var_id), VariableData(str(value)))
+        return True
+    except Exception as e:
+        print(f"Error setting string var s{screen_id} v{var_id}: {e}")
+        return False
+
 # ========================
 # JSON-based state helpers
 # ========================
@@ -325,6 +344,11 @@ def monitor_touch_encoder_loop():
     # Track the last index we wrote a name for, so we only push on change
     last_shown_index = None
 
+    # Screen 19 display caches — only push to encoder when value changes
+    last_state_status = None
+    last_state_preset = None
+    last_state_btn_text = None
+
     while True:
         # Get current screen (with retries)
         active_screen = safe_get_screen()
@@ -385,17 +409,26 @@ def monitor_touch_encoder_loop():
         # ---------------------------------------------
         elif active_screen == ScreenID(17):
             variety_index = get_variable(10, 1)
-            save_active_variety(variety_index)  # Save active variety to JSON
 
-            saved_data = load_variety_data()
-            # Display which variety is loaded on screen 18 (show its name)
+            # Show the user feedback FIRST: push the name onto screen 18 and
+            # navigate there immediately. The value loads below take ~8 set_var
+            # round-trips, so doing the visual confirmation up front makes the
+            # selection feel instant.
             write_variety_to_screen(variety_index, 18, 2)
+            try:
+                te.guide.set_screen(ScreenID(18))
+            except Exception as e:
+                print(f"Error setting screen 18: {e}")
+
+            save_active_variety(variety_index)  # Save active variety to JSON
+            saved_data = load_variety_data()
 
             key = str(variety_index)
             if key in saved_data and isinstance(saved_data[key], dict):
                 saved_values = saved_data[key]
 
-                # Push saved values into the encoder
+                # Push saved values into the encoder (done after navigation
+                # so the user already sees the new screen).
                 set_variable(6, 1, saved_values.get("roller_speed", 0))        # Roller Speed
                 set_variable(3, 1, saved_values.get("belt_speed", 0))          # Belt Speed
                 set_variable(11, 1, saved_values.get("irrigation_delay", 0))   # Irrigation Delay
@@ -410,9 +443,53 @@ def monitor_touch_encoder_loop():
             else:
                 print(f"Variety {variety_index} not found. Waiting for user to define it.")
 
-            time.sleep(2)
-            # Variety selected confirmation screen
-            te.guide.set_screen(ScreenID(18))
+        # ---------------------------------------------
+        # Screen 19: Machine state (status + start/stop button)
+        # ---------------------------------------------
+        elif active_screen == ScreenID(STATE_SCREEN):
+            data = locked_read_json(JSON_FILE_PATH) or {}
+            running = bool(data.get("ready_to_run", False))
+            active_variety = data.get("active_variety", None)
+
+            status_text = "Running" if running else "Stopped"
+            btn_text = "Stop Machine" if running else "Start Machine"
+            preset_text = (
+                get_variety_name(active_variety) if active_variety is not None else ""
+            )
+
+            if status_text != last_state_status:
+                set_string_var(STATE_SCREEN, STATE_STATUS_VAR, status_text)
+                last_state_status = status_text
+            if preset_text != last_state_preset:
+                set_string_var(STATE_SCREEN, STATE_PRESET_VAR, preset_text)
+                last_state_preset = preset_text
+            if btn_text != last_state_btn_text:
+                set_string_var(STATE_SCREEN, STATE_BTN_TEXT_VAR, btn_text)
+                last_state_btn_text = btn_text
+
+            # Button 1 ("Set value" action in GUIDE) writes 1 into the press
+            # var on tap. Treat any nonzero as a press: repaint the encoder
+            # first so the UI feels immediate, THEN flip ready_to_run.
+            try:
+                pressed = safe_get_var(STATE_SCREEN, STATE_BTN_PRESS_VAR)
+            except Exception:
+                pressed = 0
+            if pressed:
+                new_running = not running
+                new_status_text = "Running" if new_running else "Stopped"
+                new_btn_text = "Stop Machine" if new_running else "Start Machine"
+                set_string_var(STATE_SCREEN, STATE_STATUS_VAR, new_status_text)
+                set_string_var(STATE_SCREEN, STATE_BTN_TEXT_VAR, new_btn_text)
+                last_state_status = new_status_text
+                last_state_btn_text = new_btn_text
+                ready_to_run_toggle(new_running)
+                set_variable(STATE_SCREEN, STATE_BTN_PRESS_VAR, 0)
+
+        else:
+            # Leaving the state screen — invalidate caches so re-entry repaints.
+            last_state_status = None
+            last_state_preset = None
+            last_state_btn_text = None
 
         time.sleep(POLL_INTERVAL_SEC)
 

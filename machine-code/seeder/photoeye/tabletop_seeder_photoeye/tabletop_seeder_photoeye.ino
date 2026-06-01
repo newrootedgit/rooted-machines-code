@@ -611,6 +611,14 @@ void loop() {
   bool inputState = digitalRead(inputPin1);
   static bool lastPhotoeyeState = false;
 
+  // Roller-start gate state (reset each sequence). The roller is committed once
+  // per sequence at roller-start and latched — see the roller block below.
+  static bool rollerGateEvaluated = false;
+  static bool rollerAllowed       = false;
+  // Set on the photoeye falling edge if the tray blocked the beam long enough
+  // to be a real tray (vs a noise/debris false trigger). Gates traysProcessed.
+  static bool trayBlockValid      = false;
+
   // Rising-edge only: a tray that's still parked in front of the photoeye
   // when the previous sequence ends must not immediately re-fire — wait for
   // it to clear and a new tray to arrive. Refuse to start without a valid
@@ -618,7 +626,34 @@ void loop() {
   if (inputState && !lastPhotoeyeState && !sequenceActive && ready_to_run_flag && belt_speed_valid) {
       startTime = millis();
       sequenceActive = true;
+      rollerGateEvaluated = false;
+      rollerAllowed       = false;
+      trayBlockValid      = false;
       DBG_PRINTLN("Photoeye rising edge: Starting event sequence.");
+  }
+
+  // Falling edge: tray trailing edge has cleared the photoeye. Measure how long
+  // the beam was blocked and decide locally whether this was a real tray. We
+  // use the same belt_speed time-base the sequence timings use, so any scaling
+  // cancels. The lower bound is deliberately generous (MIN_TRAY_BLOCK_FRACTION
+  // of the expected full-tray block time) so smaller or larger trays still
+  // count — only brief noise/debris false triggers are rejected. This only
+  // gates the local traysProcessed counter; no new data is sent to the Pi.
+  //
+  // Scale the expected block time by any roller-duration extension the user
+  // dialed in: a longer roller duration implies a longer tray, which blocks the
+  // beam proportionally longer. user_roller_end_mod_value*100 is already in ms
+  // (same units as the timing math), so it adds directly. Only extend, never
+  // shorten, the expected window.
+  static const float MIN_TRAY_BLOCK_FRACTION = 0.3f;
+  if (!inputState && lastPhotoeyeState && sequenceActive && belt_speed_valid) {
+      unsigned long blockMs = millis() - startTime;
+      float rollerDurationExtraMs = user_roller_end_mod_value > 0.0f
+                                        ? user_roller_end_mod_value * 100.0f
+                                        : 0.0f;
+      float expectedBlockMs = (tray_length / belt_speed) * 1000.0f + rollerDurationExtraMs;
+      trayBlockValid = (expectedBlockMs > 0.0f) &&
+                       ((float)blockMs >= MIN_TRAY_BLOCK_FRACTION * expectedBlockMs);
   }
   lastPhotoeyeState = inputState;
 
@@ -642,8 +677,25 @@ void loop() {
       }
 
       if (elapsedTime >= rollerStartMs && elapsedTime < rollerEndMs) {
-          // Serial.println("Roller ON (Function Call Would Happen Here)");
-          HopperMoveVelocity(user_hopper_rpm);  // Example values: 100 RPM
+          // Roller-start gate: only commit the roller if the tray is STILL
+          // blocking the photoeye at roller-start. A real tray (~0.53 m) is
+          // much longer than the sensor->roller distance (~0.25 m), so it must
+          // still cover the beam here. If it doesn't, the rising edge was a
+          // false trigger (noise/debris/short object) and we suppress the
+          // roller for this sequence to avoid dispensing onto bare belt.
+          // Evaluate ONCE at roller-start, then latch — do NOT gate on live
+          // photoeye state, since a real tray legitimately clears the beam
+          // (~0.53 m) well before roller-end (~0.79 m).
+          if (!rollerGateEvaluated) {
+              rollerGateEvaluated = true;
+              rollerAllowed = inputState;
+              if (!rollerAllowed) {
+                  DBG_PRINTLN("Roller suppressed: photoeye cleared before roller-start (likely false trigger).");
+              }
+          }
+          if (rollerAllowed) {
+              HopperMoveVelocity(user_hopper_rpm);  // Example values: 100 RPM
+          }
 
       } else if (elapsedTime >= rollerEndMs) {
           // Serial.println("Roller OFF");
@@ -661,7 +713,14 @@ void loop() {
 
       if (elapsedTime >= irrigationEndMs && elapsedTime >= rollerEndMs && elapsedTime >= mistingEndMs) {
           sequenceActive = false;
-          t.traysProcessed++;
+          // Only count real trays. Either the trailing edge cleared the beam
+          // long enough to validate (trayBlockValid), or the tray is still over
+          // the photoeye at sequence end (a tray longer than the sequence
+          // window) — both are real trays. A brief false trigger validates as
+          // neither and is not counted.
+          if (trayBlockValid || inputState) {
+              t.traysProcessed++;
+          }
       }
   }
 
