@@ -447,6 +447,13 @@ def monitor_touch_encoder_loop():
         # Screen 19: Machine state (status + start/stop button)
         # ---------------------------------------------
         elif active_screen == ScreenID(STATE_SCREEN):
+            # On first arrival, zero the press var so the stale "Set value"
+            # default from GUIDE isn't misread as a real tap. last_state_status
+            # being None is our "just entered screen 19" signal.
+            first_entry = last_state_status is None
+            if first_entry:
+                set_variable(STATE_SCREEN, STATE_BTN_PRESS_VAR, 0)
+
             data = locked_read_json(JSON_FILE_PATH) or {}
             running = bool(data.get("ready_to_run", False))
             active_variety = data.get("active_variety", None)
@@ -470,8 +477,9 @@ def monitor_touch_encoder_loop():
             # Button 1 ("Set value" action in GUIDE) writes 1 into the press
             # var on tap. Treat any nonzero as a press: repaint the encoder
             # first so the UI feels immediate, THEN flip ready_to_run.
+            # Skip on first_entry — we just zeroed the var ourselves.
             try:
-                pressed = safe_get_var(STATE_SCREEN, STATE_BTN_PRESS_VAR)
+                pressed = 0 if first_entry else safe_get_var(STATE_SCREEN, STATE_BTN_PRESS_VAR)
             except Exception:
                 pressed = 0
             if pressed:
