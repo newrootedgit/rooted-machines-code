@@ -3,6 +3,7 @@ import os
 import json
 import socket
 import fcntl
+import time
 from typing import Dict
 
 # ========================
@@ -12,6 +13,11 @@ HOST = "192.168.10.1"
 PORT = 8888
 JSON_FILE_PATH = "/home/rooted/te-cli/TE_Variable_Values.json"
 LOCK_FILE_PATH = JSON_FILE_PATH + ".lock"
+
+# Match the tabletop seeder TCP behavior: keep the ClearCore connection open
+# and push a fresh line when state changes, plus a periodic heartbeat.
+POLL_INTERVAL_S = 0.5
+HEARTBEAT_INTERVAL_S = 10.0
 
 # ========================
 # Lock helpers (advisory)
@@ -89,41 +95,76 @@ def load_state() -> Dict:
         "blade_height": variety_values["blade_height"],
     }
 
+def build_payload() -> str:
+    state = load_state()
+    # Field order is the contract with the ClearCore parser.
+    # Format: ready_to_run,active_variety,blade_speed,belt_speed,blade_height
+    payload_fields = [
+        state["ready_to_run"],
+        state["active_variety"],
+        state["blade_speed"],
+        state["belt_speed"],
+        state["blade_height"],
+    ]
+    return ",".join(str(x) for x in payload_fields)
+
+def serve_client(conn: socket.socket, addr) -> None:
+    """
+    Hold the connection open and push newline-terminated CSV snapshots when
+    values change, plus heartbeat refreshes.
+    """
+    conn.settimeout(5.0)
+    try:
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
+
+    print(f"tcp: [persistent-v2] client connected {addr}")
+    last_sent = None
+    last_sent_at = 0.0
+
+    try:
+        while True:
+            try:
+                payload = build_payload()
+            except Exception as e:
+                print(f"tcp: payload error for {addr}: {e}")
+                time.sleep(POLL_INTERVAL_S)
+                continue
+
+            now = time.monotonic()
+            changed = payload != last_sent
+            heartbeat = (now - last_sent_at) >= HEARTBEAT_INTERVAL_S
+
+            if changed or heartbeat:
+                try:
+                    conn.sendall((payload + "\n").encode("utf-8"))
+                except (BrokenPipeError, ConnectionResetError, socket.timeout, OSError) as e:
+                    print(f"tcp: client {addr} disconnected: {e}")
+                    return
+                if changed:
+                    print(f"tcp: {addr} <- '{payload}'")
+                last_sent = payload
+                last_sent_at = now
+
+            time.sleep(POLL_INTERVAL_S)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
 def serve():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         # Allow quick restart after crash
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind((HOST, PORT))
         s.listen(5)
-        print(f"tcp: serving on {HOST}:{PORT}")
+        print(f"tcp: [persistent-v2] serving on {HOST}:{PORT}")
 
         while True:
             conn, addr = s.accept()
-            with conn:
-                try:
-                    state = load_state()
-
-                    # CSV payload in a fixed order for ClearCore or other client
-                    # Format: ready_to_run,active_variety,blade_speed,belt_speed,blade_height
-                    payload_fields = [
-                        state["ready_to_run"],
-                        state["active_variety"],
-                        state["blade_speed"],
-                        state["belt_speed"],
-                        state["blade_height"],
-                    ]
-                    payload = ",".join(str(x) for x in payload_fields)
-
-                    conn.sendall(payload.encode("utf-8"))
-
-                    print(f"tcp: {addr} -> '{payload}'")
-
-                except Exception as e:
-                    try:
-                        conn.sendall(b"ERR")
-                    except Exception:
-                        pass
-                    print(f"tcp: error serving {addr}: {e}")
+            serve_client(conn, addr)
 
 if __name__ == "__main__":
     serve()

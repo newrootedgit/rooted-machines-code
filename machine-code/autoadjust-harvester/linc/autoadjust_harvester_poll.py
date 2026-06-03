@@ -485,7 +485,10 @@ def monitor_touch_encoder_loop():
         # Screen 19: Edit Mode - Load Selected Variety Settings
         # ---------------------------------------------
         if active_screen == ScreenID(19):
-            variety_index = get_variable(26, 1)
+            # Edit button now lives on each preset of the Variety Selection
+            # screen (10), the same way the seeder does it. Load settings for
+            # the preset that was selected there when edit was pressed.
+            variety_index = get_variable(10, 1)
             save_active_variety(variety_index)  # Save active variety to JSON
 
             saved_data = load_variety_data()
@@ -524,7 +527,7 @@ def monitor_touch_encoder_loop():
         # Screen 9: Save Preset
         # -----------------------------
         if active_screen == ScreenID(9):
-            variety_index = get_variable(26, 1)     # current variety selection (Edit Mode screen)
+            variety_index = get_variable(10, 1)     # current variety selection (edit button lives on screen 10)
             blade_speed = get_variable(6, 1)       # blade speed
             belt_speed = get_variable(3, 1)         # belt speed
             blade_height = get_variable(16, 1)     # blade height
