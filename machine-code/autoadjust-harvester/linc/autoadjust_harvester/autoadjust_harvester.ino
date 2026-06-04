@@ -2,6 +2,7 @@
 #include "ClearCore.h"
 #include <SPI.h>
 #include <Ethernet.h>
+#include <EthernetUdp.h>
 #include <string.h>
 
 #define BladeMotor ConnectorM1
@@ -32,6 +33,30 @@ IPAddress serverIp(192, 168, 10, 1);                // Updated IP of Raspberry P
 unsigned char packetReceived[MAX_PACKET_LENGTH];
 EthernetClient client;
 
+// ---- UDP telemetry ----
+// Telemetry rides a SEPARATE UDP socket from the TCP control channel so that a
+// slow or backed-up control connection can never delay status emission.
+// Fire-and-forget — never block on send.
+EthernetUDP        Udp;
+const uint16_t     UDP_LOCAL_PORT     = 9998;
+unsigned int       remotePort         = 9999;
+const uint16_t     STATUS_INTERVAL_MS = 1000;
+
+struct TelemetryState {
+    uint32_t bootId;
+    uint32_t seq;
+    uint32_t lastStatusMs;
+    uint32_t lastRxCmdMs;
+    uint32_t faultCountBelt;
+    uint32_t faultCountBlade;
+    uint32_t udpSendFailCount;
+    bool     lastBeltFault;
+    bool     lastBladeFault;
+    uint32_t beltMotorUptimeMs;   // millis() when belt started moving (0 = idle)
+    uint32_t bladeMotorUptimeMs;  // millis() when blade started moving (0 = idle)
+};
+TelemetryState t;
+
 int accelerationLimit = 100000; // pulses per sec^2
 int screen2Var1Value = 0;  // Value for motor RPM
 int screen3Var1Value = 0;  // Value saved for later implementation
@@ -54,9 +79,6 @@ int bladeSpeed = 0;
 int beltSpeed = 0;
 int bladeHeight = 0;
 
-// Auto-polling configuration
-#define TCP_POLL_INTERVAL_MS 1000  // Poll TCP server every 1 second
-unsigned long lastTcpPollTime = 0;
 int lastBladeHeight = -1;  // Track previous blade height to detect changes
 int lastBeltSpeed = -1;    // Track previous belt speed to detect changes
 int lastBladeSpeed = -1;   // Track previous blade speed to detect changes
@@ -93,6 +115,10 @@ bool ReadFromTCPServer();
 bool ParseTCPMessage(char *message);
 void PrintTCPVariables();
 
+// Telemetry functions
+void SendStatusUpdate();
+void SendEvent(const char *eventCode, const char *motor);
+
 // ISR callback for lower limit switch (with debounce)
 void OnLowerLimitHit() {
     unsigned long now = millis();
@@ -127,8 +153,6 @@ void setup() {
     // attachInterrupt(digitalPinToInterrupt(UpperLimitPin), OnUpperLimitHit, RISING);
     // Serial.println("Interrupts attached for limit switches on DI7 and DI8");
     Serial.println("Limit switch interrupts DISABLED");
-
-    Serial.println("Setup complete. Entering loop...");
 
     ////////////////////////////////////////////////////////
     /////////////////// Linear Rail Motor Set Up (M2) //////
@@ -246,9 +270,33 @@ void setup() {
     } else {
         Serial.println("Ethernet link timeout - continuing without connection");
     }
+
+    ////////////////////////////////////////////////////////
+    /////////////// Telemetry Initialization ///////////////
+    ////////////////////////////////////////////////////////
+    t.bootId             = millis() ^ 0x5EED5EED;
+    t.seq                = 0;
+    t.lastStatusMs       = 0;
+    t.lastRxCmdMs        = millis();
+    t.faultCountBelt     = 0;
+    t.faultCountBlade    = 0;
+    t.udpSendFailCount   = 0;
+    t.lastBeltFault      = false;
+    t.lastBladeFault     = false;
+    t.beltMotorUptimeMs  = 0;
+    t.bladeMotorUptimeMs = 0;
+
+    Udp.begin(UDP_LOCAL_PORT);
+    Serial.println("UDP telemetry initialized");
+
+    Serial.println("Setup complete. TCP reconnect starts in loop.");
 }
 
 void loop() {
+    // Match the tabletop seeder pattern: service TCP first in loop. This is the
+    // first place we attempt to connect, so motor setup/homing has completed.
+    ReadFromTCPServer();
+
     // Handle limit switch interrupts (DISABLED)
     // if (lowerLimitHit) {
     //     lowerLimitHit = false;
@@ -280,10 +328,6 @@ void loop() {
         }
         lastKillSwitchState = killSwitchActive;
     }
-
-    // Non-blocking persistent TCP handling. First connect attempt happens here,
-    // after setup() finishes motor initialization.
-    ReadFromTCPServer();
 
     if (readyToRun) {
         if (!lastReadyToRunState) {
@@ -430,22 +474,39 @@ void loop() {
             LinearRailMoveAbsolute(targetPositionSteps);
         }
     }
-   
 
+    // Periodic telemetry — fire-and-forget, time-guarded so a slow socket
+    // surfaces as a warning instead of silently skewing the control loop.
+    {
+        unsigned long now = millis();
+        if (now - t.lastStatusMs >= STATUS_INTERVAL_MS) {
+            t.lastStatusMs = now;
+            uint32_t udpStart = millis();
+            SendStatusUpdate();
+            uint32_t udpDuration = millis() - udpStart;
+            if (udpDuration > 20) {
+                Serial.print("WARN telemetry blocked for ");
+                Serial.print(udpDuration);
+                Serial.println("ms");
+            }
+        }
+    }
 }
 
 bool MoveAtVelocity(int32_t velocity) {
   // Check if a motor alert is currently preventing motion
   // Clear alert if configured to do so 
     if (BeltMotor.StatusReg().bit.AlertsPresent) {
-    Serial.println("Motor alert detected.");    
+    Serial.println("Motor alert detected.");
     PrintAlerts();
+    SendEvent("FAULT_BELT", "belt");
+    t.faultCountBelt++;
     if(HANDLE_ALERTS){
       HandleAlerts();
     } else {
       Serial.println("Enable automatic alert handling by setting HANDLE_ALERTS to 1.");
     }
-    Serial.println("Move canceled.");   
+    Serial.println("Move canceled.");
     Serial.println();
         return false;
     }
@@ -455,6 +516,14 @@ bool MoveAtVelocity(int32_t velocity) {
 
     // Command the velocity move
     BeltMotor.MoveVelocity(velocity);
+
+    // Track belt-running uptime for telemetry: 0 commanded -> idle, otherwise
+    // stamp the start time so SendStatusUpdate reports the current run duration.
+    if (velocity == 0) {
+        t.beltMotorUptimeMs = 0;
+    } else if (t.beltMotorUptimeMs == 0) {
+        t.beltMotorUptimeMs = millis();
+    }
 
     // Waits for the step command to ramp up/down to the commanded velocity. 
     // This time will depend on your Acceleration Limit.
@@ -469,6 +538,8 @@ bool RampToVelocitySelection(int velocityIndex) {
     // Check if a motor fault is currently preventing motion
   // Clear fault if configured to do so 
     if (BladeMotor.StatusReg().bit.MotorInFault) {
+    SendEvent("FAULT_BLADE", "blade");
+    t.faultCountBlade++;
     if(HANDLE_MOTOR_FAULTS){
       Serial.println("Motor fault detected. Move canceled.");
       HandleMotorFaults();
@@ -512,6 +583,14 @@ bool RampToVelocitySelection(int velocityIndex) {
             return false;
     }
 
+    // Track blade-running uptime for telemetry: selection 0 -> idle, otherwise
+    // stamp the start time so SendStatusUpdate reports the current run duration.
+    if (velocityIndex == 0) {
+        t.bladeMotorUptimeMs = 0;
+    } else if (t.bladeMotorUptimeMs == 0) {
+        t.bladeMotorUptimeMs = millis();
+    }
+
     // Ensures this delay is at least 20ms longer than the Input A, B filter
     // setting in MSP
     delay(20 + INPUT_A_B_FILTER);
@@ -526,7 +605,9 @@ bool RampToVelocitySelection(int velocityIndex) {
   // Check if a motor faulted during move
   // Clear fault if configured to do so 
     if (BladeMotor.StatusReg().bit.MotorInFault) {
-    Serial.println("Motor fault detected.");    
+    Serial.println("Motor fault detected.");
+    SendEvent("FAULT_BLADE", "blade");
+    t.faultCountBlade++;
     if(HANDLE_MOTOR_FAULTS){
       HandleMotorFaults();
     } else {
@@ -743,6 +824,10 @@ bool ReadFromTCPServer() {
         if (now - lastReconnectAttempt >= 2000) {
             lastReconnectAttempt = now;
             lineLen = 0;
+            if (Ethernet.linkStatus() != LinkON) {
+                Serial.println("TCP: Ethernet link is OFF; skipping reconnect");
+                return false;
+            }
             Serial.println("TCP: attempting reconnect...");
             client.stop();
             if (client.connect(serverIp, PORT_NUM)) {
@@ -785,6 +870,8 @@ bool ReadFromTCPServer() {
 }
 
 bool ParseTCPMessage(char *message) {
+    t.lastRxCmdMs = millis(); // for telemetry cmdAgeMs
+
     int fieldIndex = 0;
     char *token = strtok(message, ",");
 
@@ -859,4 +946,72 @@ void PrintTCPVariables() {
     Serial.print("  bladeHeight: ");
     Serial.println(bladeHeight);
     Serial.println("---------------------");
+}
+
+//------------------------------------------------------------------------------
+// Telemetry — UDP fire-and-forget. NEVER block on send. Uses a separate UDP
+// socket from the TCP control channel so control-channel backpressure can't
+// stall status emission.
+//------------------------------------------------------------------------------
+
+void SendStatusUpdate() {
+    if (Ethernet.linkStatus() != LinkON) {
+        return;
+    }
+    char telemetryBuffer[256];
+    uint32_t uptimeMs = millis();
+    uint32_t cmdAgeMs = uptimeMs - t.lastRxCmdMs;
+    uint32_t seq = ++t.seq;
+
+    uint32_t beltUptime  = t.beltMotorUptimeMs  ? (uptimeMs - t.beltMotorUptimeMs)  : 0;
+    uint32_t bladeUptime = t.bladeMotorUptimeMs ? (uptimeMs - t.bladeMotorUptimeMs) : 0;
+
+    // Format (schema_ver 2):
+    //   STATUS_UPDATE,2,bootId,seq,uptimeMs,belt_motor_uptime_ms,
+    //   blade_motor_uptime_ms,cmdAgeMs
+    // Both belt and blade run continuously while commanded, so each uptime is
+    // the current run duration (0 = idle).
+    snprintf(telemetryBuffer, sizeof(telemetryBuffer),
+             "STATUS_UPDATE,2,%lu,%lu,%lu,%lu,%lu,%lu",
+             (unsigned long)t.bootId,
+             (unsigned long)seq,
+             (unsigned long)uptimeMs,
+             (unsigned long)beltUptime,
+             (unsigned long)bladeUptime,
+             (unsigned long)cmdAgeMs);
+
+    Udp.beginPacket(serverIp, remotePort);
+    Udp.write((const uint8_t *)telemetryBuffer, strlen(telemetryBuffer));
+    if (!Udp.endPacket()) {
+        t.udpSendFailCount++;
+    }
+}
+
+// Lightweight fault ping — emitted when a motor fault is detected. Receiver
+// joins with the nearest STATUS_UPDATE on (bootId, uptimeMs) for full state at
+// event time. eventCode must start with "FAULT_"; motor attributes the fault
+// ("belt" or "blade").
+void SendEvent(const char *eventCode, const char *motor) {
+    if (Ethernet.linkStatus() != LinkON) {
+        return;
+    }
+    char telemetryBuffer[128];
+    uint32_t uptimeMs = millis();
+    uint32_t seq = ++t.seq;
+
+    // Format (schema_ver 2): EVENT,2,bootId,seq,uptimeMs,eventCode,eventValue,motor
+    snprintf(telemetryBuffer, sizeof(telemetryBuffer),
+             "EVENT,2,%lu,%lu,%lu,%s,%d,%s",
+             (unsigned long)t.bootId,
+             (unsigned long)seq,
+             (unsigned long)uptimeMs,
+             eventCode,
+             1,
+             motor);
+
+    Udp.beginPacket(serverIp, remotePort);
+    Udp.write((const uint8_t *)telemetryBuffer, strlen(telemetryBuffer));
+    if (!Udp.endPacket()) {
+        t.udpSendFailCount++;
+    }
 }
