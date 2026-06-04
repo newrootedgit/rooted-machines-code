@@ -3,6 +3,7 @@ import os
 import json
 import socket
 import fcntl
+import threading
 import time
 from typing import Dict
 
@@ -152,6 +153,25 @@ def build_payload() -> str:
     return ",".join(str(x) for x in payload_fields)
 
 
+def enable_keepalive(conn: socket.socket) -> None:
+    """
+    Turn on TCP keepalive so a silently-dead peer (e.g. a ClearCore power cycle
+    that never sends a FIN/RST) gets torn down by the kernel instead of
+    lingering for the default ~15min retransmission timeout. Linux-specific
+    tuning probes after 3s idle, every 2s, dropping after 3 fails (~9s).
+    """
+    try:
+        conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        if hasattr(socket, "TCP_KEEPIDLE"):
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 3)
+        if hasattr(socket, "TCP_KEEPINTVL"):
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 2)
+        if hasattr(socket, "TCP_KEEPCNT"):
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+    except OSError:
+        pass
+
+
 def serve_client(conn: socket.socket, addr) -> None:
     """
     Hold the connection open and push a newline-terminated CSV snapshot
@@ -206,14 +226,34 @@ def serve():
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind((HOST, PORT))
         s.listen(5)
-        print(f"tcp: [persistent-v2] serving on {HOST}:{PORT}")
+        print(f"tcp: [persistent-v3] serving on {HOST}:{PORT}")
+
+        current_conn = None
 
         while True:
             conn, addr = s.accept()
-            # One client at a time matches the ClearCore deployment (single
-            # motor controller). If a second client connects, finish serving
-            # the current one first.
-            serve_client(conn, addr)
+            enable_keepalive(conn)
+
+            # Single-client deployment: a new connection almost always means the
+            # ClearCore rebooted and reconnected while we were still holding its
+            # stale socket. Drop the previous connection so the fresh one wins
+            # immediately instead of waiting for the old one to time out. The
+            # old serve_client thread then errors out on its next send and exits.
+            if current_conn is not None:
+                print(f"tcp: new client {addr}, dropping previous connection")
+                try:
+                    current_conn.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                try:
+                    current_conn.close()
+                except OSError:
+                    pass
+
+            current_conn = conn
+            threading.Thread(
+                target=serve_client, args=(conn, addr), daemon=True
+            ).start()
 
 if __name__ == "__main__":
     serve()

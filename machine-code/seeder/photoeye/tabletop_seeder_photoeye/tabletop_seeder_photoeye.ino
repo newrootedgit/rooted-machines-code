@@ -433,12 +433,12 @@ void setup() {
         delay(1000);
     }
 
-    Serial.println("[line-framed-v2] firmware boot");
-    if (client.connect(serverIp, PORT_NUM)) {
-        Serial.println("Connected to server.");
-    } else {
-        Serial.println("Failed to connect to server.");
-    }
+    // Serial.println("[line-framed-v2] firmware boot");
+    // if (client.connect(serverIp, PORT_NUM)) {
+    //     Serial.println("Connected to server.");
+    // } else {
+    //     Serial.println("Failed to connect to server.");
+    // }
 
     /////////////////////////////////////////////////////////
     /////////////        Motor Set Up           /////////////

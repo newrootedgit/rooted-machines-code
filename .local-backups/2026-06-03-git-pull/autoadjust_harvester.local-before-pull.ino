@@ -2,7 +2,6 @@
 #include "ClearCore.h"
 #include <SPI.h>
 #include <Ethernet.h>
-#include <string.h>
 
 #define BladeMotor ConnectorM1
 
@@ -61,7 +60,6 @@ int lastBladeHeight = -1;  // Track previous blade height to detect changes
 int lastBeltSpeed = -1;    // Track previous belt speed to detect changes
 int lastBladeSpeed = -1;   // Track previous blade speed to detect changes
 bool lastKillSwitchState = false;  // Track kill switch state changes
-bool lastReadyToRunState = false;  // Track ready_to_run changes
 
 // Belt speed scaling factor (converts beltSpeed value to pulses/sec)
 #define BELT_SPEED_SCALE 600  // Adjust this to tune belt speed
@@ -90,7 +88,6 @@ void HandleLinearRailAlerts();
 
 // TCP communication functions
 bool ReadFromTCPServer();
-bool ParseTCPMessage(char *message);
 void PrintTCPVariables();
 
 // ISR callback for lower limit switch (with debounce)
@@ -281,87 +278,78 @@ void loop() {
         lastKillSwitchState = killSwitchActive;
     }
 
-    // Non-blocking persistent TCP handling. First connect attempt happens here,
-    // after setup() finishes motor initialization.
-    ReadFromTCPServer();
+    // Auto-poll TCP server at regular intervals
+    if (millis() - lastTcpPollTime >= TCP_POLL_INTERVAL_MS) {
+        lastTcpPollTime = millis();
 
-    if (readyToRun) {
-        if (!lastReadyToRunState) {
-            Serial.println("ready_to_run active");
-            lastBeltSpeed = -1;
-            lastBladeSpeed = -1;
-        }
+        if (ReadFromTCPServer()) {
+            // Only act when ready to run
+            if (readyToRun) {
+                // Check if blade height changed - pause motors during rail move
+                if (bladeHeight != lastBladeHeight && bladeHeight >= 0) {
+                    Serial.print("Blade height changed: ");
+                    Serial.print(lastBladeHeight);
+                    Serial.print(" -> ");
+                    Serial.println(bladeHeight);
 
-        // Check if blade height changed - pause motors during rail move
-        if (bladeHeight != lastBladeHeight && bladeHeight >= 0) {
-            Serial.print("Blade height changed: ");
-            Serial.print(lastBladeHeight);
-            Serial.print(" -> ");
-            Serial.println(bladeHeight);
+                    // Pause belt and blade motors before moving rail
+                    if (killSwitchActive) {
+                        Serial.println("Pausing belt and blade for rail move...");
+                        MoveAtVelocity(0);  // Stop belt
+                        RampToVelocitySelection(0);  // Stop blade
+                    }
 
-            // Pause belt and blade motors before moving rail
-            if (killSwitchActive) {
-                Serial.println("Pausing belt and blade for rail move...");
-                MoveAtVelocity(0);  // Stop belt
-                RampToVelocitySelection(0);  // Stop blade
-            }
+                    // Convert blade height (mm) to steps and move linear rail
+                    int32_t targetPositionSteps = -bladeHeight * STEPS_PER_MM;
+                    LinearRailMoveAbsolute(targetPositionSteps);
 
-            // Convert blade height (mm) to steps and move linear rail
-            int32_t targetPositionSteps = -bladeHeight * STEPS_PER_MM;
-            LinearRailMoveAbsolute(targetPositionSteps);
+                    lastBladeHeight = bladeHeight;
 
-            lastBladeHeight = bladeHeight;
+                    // Resume belt and blade motors after rail move (if kill switch active)
+                    if (killSwitchActive) {
+                        Serial.println("Rail move complete. Resuming belt and blade...");
+                        // Re-apply belt speed
+                        int32_t beltVelocity = -beltSpeed * BELT_SPEED_SCALE;
+                        MoveAtVelocity(beltVelocity);
+                        // Re-apply blade speed
+                        RampToVelocitySelection(bladeSpeed);
+                        Serial.println("Motors resumed");
+                    }
+                }
 
-            // Resume belt and blade motors after rail move (if kill switch active)
-            if (killSwitchActive) {
-                Serial.println("Rail move complete. Resuming belt and blade...");
-                // Re-apply belt speed
-                int32_t beltVelocity = -beltSpeed * BELT_SPEED_SCALE;
-                MoveAtVelocity(beltVelocity);
-                // Re-apply blade speed
-                RampToVelocitySelection(bladeSpeed);
-                Serial.println("Motors resumed");
-            }
-        }
+                // Only run belt and blade motors if kill switch is active
+                if (killSwitchActive) {
+                    // Check if belt speed changed
+                    if (beltSpeed != lastBeltSpeed) {
+                        Serial.print("Belt speed changed: ");
+                        Serial.print(lastBeltSpeed);
+                        Serial.print(" -> ");
+                        Serial.println(beltSpeed);
 
-        // Only run belt and blade motors if kill switch is active
-        if (killSwitchActive) {
-            // Check if belt speed changed
-            if (beltSpeed != lastBeltSpeed) {
-                Serial.print("Belt speed changed: ");
-                Serial.print(lastBeltSpeed);
-                Serial.print(" -> ");
-                Serial.println(beltSpeed);
+                        // Convert belt speed value to velocity (pulses/sec)
+                        // Negative to reverse direction
+                        int32_t beltVelocity = -beltSpeed * BELT_SPEED_SCALE;
+                        MoveAtVelocity(beltVelocity);
 
-                // Convert belt speed value to velocity (pulses/sec)
-                // Negative to reverse direction
-                int32_t beltVelocity = -beltSpeed * BELT_SPEED_SCALE;
-                MoveAtVelocity(beltVelocity);
+                        lastBeltSpeed = beltSpeed;
+                    }
 
-                lastBeltSpeed = beltSpeed;
-            }
+                    // Check if blade speed changed
+                    if (bladeSpeed != lastBladeSpeed) {
+                        Serial.print("Blade speed changed: ");
+                        Serial.print(lastBladeSpeed);
+                        Serial.print(" -> ");
+                        Serial.println(bladeSpeed);
 
-            // Check if blade speed changed
-            if (bladeSpeed != lastBladeSpeed) {
-                Serial.print("Blade speed changed: ");
-                Serial.print(lastBladeSpeed);
-                Serial.print(" -> ");
-                Serial.println(bladeSpeed);
+                        // Use blade speed as velocity selection (0-3)
+                        RampToVelocitySelection(bladeSpeed);
 
-                // Use blade speed as velocity selection (0-3)
-                RampToVelocitySelection(bladeSpeed);
-
-                lastBladeSpeed = bladeSpeed;
+                        lastBladeSpeed = bladeSpeed;
+                    }
+                }
             }
         }
-    } else if (lastReadyToRunState) {
-        MoveAtVelocity(0);
-        RampToVelocitySelection(0);
-        lastBeltSpeed = -1;
-        lastBladeSpeed = -1;
-        Serial.println("ready_to_run inactive - belt and blade stopped");
     }
-    lastReadyToRunState = readyToRun;
 
     // Check for serial input
     if (Serial.available() > 0) {
@@ -450,7 +438,7 @@ bool MoveAtVelocity(int32_t velocity) {
         return false;
     }
 
-    Serial.print("Moving belt at velocity: ");
+    // Serial.print("Moving at velocity: ");
     // Serial.println(velocity);
 
     // Command the velocity move
@@ -478,8 +466,8 @@ bool RampToVelocitySelection(int velocityIndex) {
         return false;
     }
 
-    Serial.print("Moving to Velocity Selection: ");
-    Serial.print(velocityIndex);
+    // Serial.print("Moving to Velocity Selection: ");
+    // Serial.print(velocityIndex);
 
     switch (velocityIndex) {
         case 0:
@@ -521,6 +509,7 @@ bool RampToVelocitySelection(int velocityIndex) {
     Serial.println("Moving.. Waiting for HLFB");
     while (BladeMotor.HlfbState() != MotorDriver::HLFB_ASSERTED &&
       !BladeMotor.StatusReg().bit.MotorInFault) {
+        Serial.println("here?");
         continue;
     }
   // Check if a motor faulted during move
@@ -727,119 +716,66 @@ void HandleLinearRailAlerts() {
 
 /*
  * ReadFromTCPServer
- *    Maintains a persistent TCP connection and reads newline-framed CSV data.
+ *    Connects to the Raspberry Pi TCP server and reads the CSV data
  *    CSV format: ready_to_run,active_variety,blade_speed,belt_speed,blade_height
- *    Returns true when at least one new snapshot was parsed.
+ *    Returns true if successful, false otherwise
  */
 bool ReadFromTCPServer() {
-    static unsigned long lastReconnectAttempt = 0;
-    static char lineBuf[MAX_PACKET_LENGTH];
-    static char lastLine[MAX_PACKET_LENGTH];
-    static size_t lineLen = 0;
-    bool parsedSnapshot = false;
+    if (client.connect(serverIp, PORT_NUM)) {
+        // Wait for data with timeout
+        uint32_t timeout = millis();
+        while (!client.available() && millis() - timeout < 2000) {
+            delay(10);
+        }
 
-    if (!client.connected()) {
-        unsigned long now = millis();
-        if (now - lastReconnectAttempt >= 2000) {
-            lastReconnectAttempt = now;
-            lineLen = 0;
-            Serial.println("TCP: attempting reconnect...");
+        if (client.available()) {
+            int len = client.read(packetReceived, MAX_PACKET_LENGTH - 1);
+            packetReceived[len] = '\0';
+
+            // Parse CSV: ready_to_run,active_variety,blade_speed,belt_speed,blade_height
+            char *token;
+            char *packetCopy = (char *)packetReceived;
+
+            token = strtok(packetCopy, ",");
+            if (token != NULL) readyToRun = atoi(token);
+
+            token = strtok(NULL, ",");
+            if (token != NULL) activeVariety = atoi(token);
+
+            token = strtok(NULL, ",");
+            if (token != NULL) bladeSpeed = atoi(token);
+
+            token = strtok(NULL, ",");
+            if (token != NULL) beltSpeed = atoi(token);
+
+            token = strtok(NULL, ",");
+            if (token != NULL) bladeHeight = atoi(token);
+
+            // Print labeled values (COMMENTED OUT FOR TESTING)
+            // Serial.print("TCP: ready=");
+            // Serial.print(readyToRun);
+            // Serial.print(" variety=");
+            // Serial.print(activeVariety);
+            // Serial.print(" blade=");
+            // Serial.print(bladeSpeed);
+            // Serial.print(" belt=");
+            // Serial.print(beltSpeed);
+            // Serial.print(" height=");
+            // Serial.print(bladeHeight);
+            // Serial.print(" motors=");
+            // Serial.println(digitalRead(KillSwitchPin) ? "ENABLED" : "DISABLED");
+
             client.stop();
-            if (client.connect(serverIp, PORT_NUM)) {
-                Serial.println("TCP: connected to server");
-            } else {
-                Serial.println("TCP: connection failed");
-            }
+            return true;
         }
+
+        client.stop();
+        Serial.println("TCP: No data received");
+        return false;
+    } else {
+        Serial.println("TCP: Connection failed");
         return false;
     }
-
-    while (client.available() > 0) {
-        int c = client.read();
-        if (c < 0) {
-            break;
-        }
-        if (c == '\r') {
-            continue;
-        }
-        if (c == '\n') {
-            if (lineLen > 0) {
-                lineBuf[lineLen] = '\0';
-                if (strcmp(lineBuf, lastLine) != 0) {
-                    memcpy(lastLine, lineBuf, lineLen + 1);
-                    if (ParseTCPMessage(lineBuf)) {
-                        parsedSnapshot = true;
-                    }
-                }
-            }
-            lineLen = 0;
-        } else if (lineLen < sizeof(lineBuf) - 1) {
-            lineBuf[lineLen++] = (char)c;
-        } else {
-            lineLen = 0;
-            Serial.println("TCP: packet too long, resyncing");
-        }
-    }
-
-    return parsedSnapshot;
-}
-
-bool ParseTCPMessage(char *message) {
-    int fieldIndex = 0;
-    char *token = strtok(message, ",");
-
-    int parsedReadyToRun = 0;
-    int parsedActiveVariety = -1;
-    int parsedBladeSpeed = 0;
-    int parsedBeltSpeed = 0;
-    int parsedBladeHeight = 0;
-
-    while (token != NULL && fieldIndex < 5) {
-        switch (fieldIndex) {
-            case 0:
-                parsedReadyToRun = atoi(token);
-                break;
-            case 1:
-                parsedActiveVariety = atoi(token);
-                break;
-            case 2:
-                parsedBladeSpeed = atoi(token);
-                break;
-            case 3:
-                parsedBeltSpeed = atoi(token);
-                break;
-            case 4:
-                parsedBladeHeight = atoi(token);
-                break;
-        }
-
-        fieldIndex++;
-        token = strtok(NULL, ",");
-    }
-
-    if (fieldIndex < 5) {
-        Serial.println("TCP: invalid CSV snapshot");
-        return false;
-    }
-
-    readyToRun = parsedReadyToRun;
-    activeVariety = parsedActiveVariety;
-    bladeSpeed = parsedBladeSpeed;
-    beltSpeed = parsedBeltSpeed;
-    bladeHeight = parsedBladeHeight;
-
-    Serial.print("TCP: ready=");
-    Serial.print(readyToRun);
-    Serial.print(" variety=");
-    Serial.print(activeVariety);
-    Serial.print(" blade=");
-    Serial.print(bladeSpeed);
-    Serial.print(" belt=");
-    Serial.print(beltSpeed);
-    Serial.print(" height=");
-    Serial.println(bladeHeight);
-
-    return true;
 }
 
 /*
