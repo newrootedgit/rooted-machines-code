@@ -96,6 +96,36 @@ def load_state() -> Dict:
         "blade_height": variety_values["blade_height"],
     }
 
+def force_ready_to_run_false() -> None:
+    """
+    Root fail-safe: clear ready_to_run on disk before we serve any client.
+
+    This server is the ONLY bridge to the ClearCore, so forcing the flag false
+    here guarantees the first payload we can ever send is ready=0 — no matter the
+    boot order relative to the poll script. Without this, a stale ready_to_run=true
+    persisted from a previous session is streamed to the controller the instant the
+    ClearCore connects, before the poll process clears it. Belt/blade are also
+    kill-switch gated in firmware, but the linear-rail blade-height move is not, so
+    it can self-position from stale state. A control-bridge (re)start must always
+    fail safe to stopped.
+    """
+    try:
+        with FileLock(LOCK_FILE_PATH, shared=False):
+            try:
+                with open(JSON_FILE_PATH, "r") as f:
+                    data = json.load(f)
+            except (FileNotFoundError, json.JSONDecodeError):
+                data = {}
+            if data.get("ready_to_run", False):
+                data["ready_to_run"] = False
+                with open(JSON_FILE_PATH, "w") as f:
+                    json.dump(data, f, indent=4)
+                print("tcp: startup fail-safe - cleared stale ready_to_run")
+    except OSError as e:
+        # Never let a startup write hiccup keep the server from coming up.
+        print(f"tcp: could not clear ready_to_run at startup: {e}")
+
+
 def build_payload() -> str:
     state = load_state()
     # Field order is the contract with the ClearCore parser.
@@ -174,6 +204,10 @@ def serve_client(conn: socket.socket, addr) -> None:
             pass
 
 def serve():
+    # Clear any stale ready_to_run BEFORE binding/accepting, so the first
+    # snapshot a connecting ClearCore receives is always stopped.
+    force_ready_to_run_false()
+
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         # Allow quick restart after crash
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

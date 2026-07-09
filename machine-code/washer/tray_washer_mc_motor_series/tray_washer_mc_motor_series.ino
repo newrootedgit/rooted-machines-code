@@ -2,6 +2,7 @@
 #include <SPI.h>
 
 #define DriveMotor ConnectorM0
+#define Solenoid ConnectorIO1
 
 #define SPEED_POT ConnectorA9  // Potentiometer for drive speed control
 
@@ -102,8 +103,13 @@ bool DriveMoveVelocity(int32_t velocity) {
         return false;
     }
 
-    DriveMotor.MoveVelocity(velocity);
+    // Drive is wired so positive pulses run backwards -- flip the sign here.
+    DriveMotor.MoveVelocity(reverseMotor(velocity));
     return true;
+}
+
+int32_t reverseMotor(int32_t velocity) { 
+  return -velocity;
 }
 
 void PrintAlerts(){

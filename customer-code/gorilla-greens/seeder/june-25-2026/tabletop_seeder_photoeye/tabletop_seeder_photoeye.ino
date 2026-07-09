@@ -95,7 +95,12 @@ TelemetryState t;
 float tray_length = 0.5302; // meters
 
 float distance_irrigation_start = 0.635-tray_length - .1;
-float distance_roller_start = 0.8382 - tray_length - 0.06; // 0.196
+// Gorilla Greens (june-25-2026 machine): the photoeye is mounted exactly
+// 5 inches from the start of the roller, so the sensor->roller belt-travel
+// distance is 5 in * 0.0254 = 0.127 m (vs ~0.248 m on the reference machine).
+// distance_roller_start IS that sensor->roller distance (see the roller-start
+// gate comment below), so set it directly from the measured 5 in.
+float distance_roller_start = 0.127; // 5 in (0.127 m) sensor -> roller start
 float distance_misting_start = 0.9398 - tray_length; //0.3302
 
 float distance_irrigation_end = distance_irrigation_start + tray_length;
@@ -681,8 +686,8 @@ void loop() {
       if (elapsedTime >= rollerStartMs && elapsedTime < rollerEndMs) {
           // Roller-start gate: only commit the roller if the tray is STILL
           // blocking the photoeye at roller-start. A real tray (~0.53 m) is
-          // much longer than the sensor->roller distance (~0.25 m), so it must
-          // still cover the beam here. If it doesn't, the rising edge was a
+          // much longer than the sensor->roller distance (0.127 m / 5 in on
+          // this machine), so it must still cover the beam here. If it doesn't, the rising edge was a
           // false trigger (noise/debris/short object) and we suppress the
           // roller for this sequence to avoid dispensing onto bare belt.
           // Evaluate ONCE at roller-start, then latch — do NOT gate on live

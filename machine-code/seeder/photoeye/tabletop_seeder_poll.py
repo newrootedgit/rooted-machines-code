@@ -509,6 +509,13 @@ def main():
 
     ensure_json_exists(JSON_FILE_PATH)
 
+    # Fail-safe: clear any stale ready_to_run persisted from a previous session
+    # BEFORE discovery/restore. The TCP server is a separate process that streams
+    # this JSON to the ClearCore continuously; if we leave ready_to_run=true on
+    # disk during the ~2s discover+restore window, the belt starts on its own
+    # until the monitor loop finally forces it false. Stop first, then bring up.
+    ready_to_run_toggle(False)
+
     # Initial discovery
     te = discover_te_blocking()
     # On startup or reconnect, restore whatever was last active
@@ -528,6 +535,9 @@ def main():
             te = handle_disconnect_and_recover()
             if te is None and RECOVERY_MODE != "restart":
                 te = discover_te_blocking()
+                # Same fail-safe as startup: clear stale ready_to_run before the
+                # restore window so the belt can't self-start during reconnect.
+                ready_to_run_toggle(False)
                 try:
                     # Write variety name before navigating to prevent flash of default string
                     write_variety_to_screen(1)
