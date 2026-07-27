@@ -4,20 +4,16 @@
 #include <EthernetUdp.h>
 #include "ClearCore.h"
 
-// Belt (conveyor) motor is no longer driven by this controller — the belt runs
-// off an external VFD. Connector M0 is unused; belt SPEED still arrives from the
-// Touch Encoder (user_belt_rpm) purely as a sequence-timing input.
+#define BeltMotor ConnectorM0
 #define HopperMotor ConnectorM2
 #define HANDLE_ALERTS (1)
 
 int accelerationLimit = 100000; // pulses per sec^2
 
 #define inputPin1 IO3  // Tray photoeye
-#define inputPin2 IO4  // Second laser gate (drives third solenoid directly)
 
 #define relay0Pin IO0 // Irrigation output
 #define relay1Pin IO1 // Misting output
-#define relay2Pin IO2 // Third solenoid output (follows second laser gate)
 
 byte mac[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED};  // MAC address
 IPAddress ip(192, 168, 10, 2);                      // Static IP
@@ -78,9 +74,12 @@ struct TelemetryState {
     uint32_t seq;
     uint32_t lastStatusMs;
     uint32_t lastRxCmdMs;
+    uint32_t faultCountBelt;
     uint32_t faultCountHopper;
     uint32_t udpSendFailCount;
+    bool     lastBeltFault;
     bool     lastHopperFault;
+    uint32_t beltMotorUptimeMs;   // millis() when belt started moving (0 = idle)
     uint32_t hopperMotorUptimeMs; // cumulative roller run time since boot, accrued
                                   // deterministically from each commanded run window
     uint32_t traysProcessed;       // number of completed sequences since boot
@@ -113,6 +112,34 @@ void printSequenceTimes(float irrigation_start, float roller_start, float mistin
     DBG_PRINT("Irrigation End: ");   DBG_PRINTLN(irrigation_end);
     DBG_PRINT("Roller End: ");       DBG_PRINTLN(roller_end);
     DBG_PRINT("Misting End: ");      DBG_PRINTLN(misting_end);
+}
+
+bool BeltMoveVelocity(int velocity) {
+    velocity = -abs(velocity);
+    if (BeltMotor.StatusReg().bit.AlertsPresent) {
+        Serial.println("Motor alert detected.");
+        PrintAlerts();
+        SendEvent("FAULT_BELT", "belt");
+        t.faultCountBelt++;
+        if(HANDLE_ALERTS){
+            HandleAlerts();
+        } else {
+            Serial.println("Enable automatic alert handling by setting HANDLE_ALERTS to 1.");
+        }
+        Serial.println("Move canceled.");
+        return false;
+    }
+    BeltMotor.MoveVelocity(velocity);
+    // Track motor-running uptime for telemetry: 0 commanded → idle.
+    if (velocity == 0) {
+        t.beltMotorUptimeMs = 0;
+    } else if (t.beltMotorUptimeMs == 0) {
+        t.beltMotorUptimeMs = millis();
+    }
+    while (!BeltMotor.StatusReg().bit.AtTargetVelocity) {
+        continue;
+    }
+    return true;
 }
 
 // Empirical scale: roller mechanism needs ~3x the commanded velocity to
@@ -269,6 +296,18 @@ void parseReceivedMessage(char *message) {
 
 void PrintAlerts() {
     Serial.println("Alerts present: ");
+    if(BeltMotor.AlertReg().bit.MotionCanceledInAlert){
+        Serial.println("    BeltMotor: MotionCanceledInAlert "); }
+    if(BeltMotor.AlertReg().bit.MotionCanceledPositiveLimit){
+        Serial.println("    BeltMotor: MotionCanceledPositiveLimit "); }
+    if(BeltMotor.AlertReg().bit.MotionCanceledNegativeLimit){
+        Serial.println("    BeltMotor: MotionCanceledNegativeLimit "); }
+    if(BeltMotor.AlertReg().bit.MotionCanceledSensorEStop){
+        Serial.println("    BeltMotor: MotionCanceledSensorEStop "); }
+    if(BeltMotor.AlertReg().bit.MotionCanceledMotorDisabled){
+        Serial.println("    BeltMotor: MotionCanceledMotorDisabled "); }
+    if(BeltMotor.AlertReg().bit.MotorFaulted){
+        Serial.println("    BeltMotor: MotorFaulted "); }
     if(HopperMotor.AlertReg().bit.MotionCanceledInAlert){
         Serial.println("    HopperMotor: MotionCanceledInAlert "); }
     if(HopperMotor.AlertReg().bit.MotionCanceledPositiveLimit){
@@ -284,6 +323,12 @@ void PrintAlerts() {
 }
 
 void HandleAlerts() {
+    if(BeltMotor.AlertReg().bit.MotorFaulted){
+        Serial.println("BeltMotor faults detected. Resetting...");
+        BeltMotor.EnableRequest(false);
+        delay(10);
+        BeltMotor.EnableRequest(true);
+    }
     if(HopperMotor.AlertReg().bit.MotorFaulted){
         Serial.println("HopperMotor faults detected. Resetting...");
         HopperMotor.EnableRequest(false);
@@ -291,6 +336,7 @@ void HandleAlerts() {
         HopperMotor.EnableRequest(true);
     }
     Serial.println("Clearing alerts.");
+    BeltMotor.ClearAlerts();
     HopperMotor.ClearAlerts();
 }
 
@@ -309,16 +355,15 @@ void SendStatusUpdate() {
     uint32_t cmdAgeMs = uptimeMs - t.lastRxCmdMs;
     uint32_t seq = ++t.seq;
 
+    uint32_t beltUptime   = t.beltMotorUptimeMs ? (uptimeMs - t.beltMotorUptimeMs) : 0;
     uint32_t hopperUptime = t.hopperMotorUptimeMs; // cumulative deterministic roller run time
 
     // Format (schema_ver 2): STATUS_UPDATE,2,bootId,seq,uptimeMs,
     //   belt_motor_uptime_ms,roller_motor_uptime_ms,cmdAgeMs,udpFails,
     //   trays_processed,varietyId,varietyName
-    // hopperUptime maps to roller_motor_uptime_ms (hopper = roller); it is a
-    // cumulative total of commanded run windows since boot.
-    // belt_motor_uptime_ms is retained as a fixed 0 placeholder: this controller
-    // no longer drives the belt (external VFD), but the field is kept so the
-    // schema_ver 2 wire format the receiver parses stays byte-compatible.
+    // hopperUptime maps to roller_motor_uptime_ms (hopper = roller). Unlike the
+    // belt (continuous, reported as current run duration), the roller value is
+    // a cumulative total of commanded run windows since boot.
     // varietyName is LAST so any snprintf truncation chops the name, not
     // the structured numeric tail.
     snprintf(telemetryBuffer, sizeof(telemetryBuffer),
@@ -326,7 +371,7 @@ void SendStatusUpdate() {
              (unsigned long)t.bootId,
              (unsigned long)seq,
              (unsigned long)uptimeMs,
-             (unsigned long)0,   // belt_motor_uptime_ms — placeholder (belt not driven)
+             (unsigned long)beltUptime,
              (unsigned long)hopperUptime,
              (unsigned long)cmdAgeMs,
              (unsigned long)t.udpSendFailCount,
@@ -373,9 +418,7 @@ void SendEvent(const char *eventCode, const char *motor) {
 void setup() {
     pinMode(relay0Pin, OUTPUT);
     pinMode(relay1Pin, OUTPUT);
-    pinMode(relay2Pin, OUTPUT);
     pinMode(inputPin1, INPUT);
-    pinMode(inputPin2, INPUT);
 
 
     Serial.begin(9600);
@@ -401,8 +444,23 @@ void setup() {
     /////////////        Motor Set Up           /////////////
     /////////////////////////////////////////////////////////
     MotorMgr.MotorModeSet(MotorManager::MOTOR_ALL, Connector::CPM_MODE_STEP_AND_DIR);
-    // Belt motor (M0) intentionally not enabled — the conveyor is driven by an
-    // external VFD, not this controller. Only the hopper/roller motor is managed.
+    BeltMotor.HlfbMode(MotorDriver::HLFB_MODE_HAS_BIPOLAR_PWM);
+    BeltMotor.HlfbCarrier(MotorDriver::HLFB_CARRIER_482_HZ);
+    BeltMotor.AccelMax(accelerationLimit);
+    BeltMotor.EnableRequest(true);
+    Serial.println("BeltMotor Enabled");
+
+    uint32_t enableStartTime = millis();
+    while (BeltMotor.HlfbState() != MotorDriver::HLFB_ASSERTED &&
+            !BeltMotor.StatusReg().bit.AlertsPresent &&
+            millis() - enableStartTime < 5000) {
+        continue;
+    }
+    if (BeltMotor.StatusReg().bit.AlertsPresent) {
+        if (HANDLE_ALERTS) HandleAlerts();
+    } else {
+        Serial.println("BeltMotor Ready");
+    }
 
     // Hopper Motor Setup
     HopperMotor.HlfbMode(MotorDriver::HLFB_MODE_HAS_BIPOLAR_PWM);
@@ -430,9 +488,12 @@ void setup() {
     t.seq                 = 0;
     t.lastStatusMs        = 0;
     t.lastRxCmdMs         = millis();
+    t.faultCountBelt      = 0;
     t.faultCountHopper    = 0;
     t.udpSendFailCount    = 0;
+    t.lastBeltFault       = false;
     t.lastHopperFault     = false;
+    t.beltMotorUptimeMs   = 0;
     t.hopperMotorUptimeMs = 0;
     t.traysProcessed       = 0;
 
@@ -489,13 +550,28 @@ void loop() {
   }
 
   ////////////////////////////////////////////////////////////
-  //////////////// Belt Speed (timing input only) /////////////
+  //////////////// Belt Run Gate //////////////////////////////
   ////////////////////////////////////////////////////////////
-  // This machine no longer drives the conveyor belt. The belt is run by an
-  // external VFD pre-programmed with fixed speed settings; the operator
-  // selects one on the VFD and enters the matching speed on the Touch Encoder.
-  // We take user_belt_rpm purely as an INPUT to the sequence-timing math below
-  // (distance / belt_speed) and issue no BeltMoveVelocity commands.
+  // Belt runs continuously while ready_to_run_flag is true. Only re-issue
+  // the velocity command when something actually changed (flag flip or
+  // live RPM update) so we don't spam the motor every tick.
+  {
+      static bool  lastBeltRunning   = false;
+      static float lastCommandedRpm  = 0;
+      bool wantBeltRunning = ready_to_run_flag && (user_belt_rpm > 0);
+
+      if (wantBeltRunning) {
+          if (!lastBeltRunning || user_belt_rpm != lastCommandedRpm) {
+              BeltMoveVelocity(user_belt_rpm);
+              lastCommandedRpm = user_belt_rpm;
+              lastBeltRunning  = true;
+          }
+      } else if (lastBeltRunning) {
+          BeltMoveVelocity(0);
+          lastCommandedRpm = 0;
+          lastBeltRunning  = false;
+      }
+  }
 
   ////////////////////////////////////////////////////////////
   //////////////// Calculate Motor Speed //////////////////////
@@ -655,19 +731,6 @@ void loop() {
               t.traysProcessed++;
           }
       }
-  }
-
-  ////////////////////////////////////////////////////////////
-  /////////// Second Laser Gate -> Third Solenoid /////////////
-  ////////////////////////////////////////////////////////////
-  // Fully independent of the tray sequence above. The third solenoid simply
-  // mirrors the second laser gate in real time: beam blocked/triggered -> ON,
-  // clear -> OFF. No delays, no timing math, and NOT gated by ready_to_run.
-  // Assumes the second gate reads HIGH when triggered, matching inputPin1's
-  // convention. If this gate is wired active-low, invert the read below.
-  {
-      bool gate2Triggered = digitalRead(inputPin2);
-      digitalWrite(relay2Pin, gate2Triggered ? HIGH : LOW);
   }
 
   // Periodic telemetry — fire-and-forget, time-guarded so a slow socket

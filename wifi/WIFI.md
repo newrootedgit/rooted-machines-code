@@ -115,7 +115,7 @@ lo             loopback  unmanaged     --
 # SHOULD SHOW 
 rooted@ChannelWasher:/opt/rootedpi$ nmcli device status
 DEVICE         TYPE      STATE         CONNECTION
-wlan0          wifi      connected     urbanfarms
+wlan0          wifi      connected     <WIFI_SSID>
 p2p-dev-wlan0  wifi-p2p  disconnected  --
 eth0           ethernet  unmanaged     --
 lo             loopback  unmanaged     --

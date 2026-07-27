@@ -4,20 +4,17 @@
 #include <EthernetUdp.h>
 #include "ClearCore.h"
 
-// Belt (conveyor) motor is no longer driven by this controller — the belt runs
-// off an external VFD. Connector M0 is unused; belt SPEED still arrives from the
-// Touch Encoder (user_belt_rpm) purely as a sequence-timing input.
+#define BeltMotor ConnectorM0
 #define HopperMotor ConnectorM2
 #define HANDLE_ALERTS (1)
 
 int accelerationLimit = 100000; // pulses per sec^2
 
-#define inputPin1 IO3  // Tray photoeye
-#define inputPin2 IO4  // Second laser gate (drives third solenoid directly)
+#define inputPin1 IO3  // Belt Start trigger
+#define inputPin2 IO2  // Belt Reset trigger
 
 #define relay0Pin IO0 // Irrigation output
 #define relay1Pin IO1 // Misting output
-#define relay2Pin IO2 // Third solenoid output (follows second laser gate)
 
 byte mac[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED};  // MAC address
 IPAddress ip(192, 168, 10, 2);                      // Static IP
@@ -58,12 +55,18 @@ char activeVarietyName[33] = "";
 // ---- Debug logging ----
 // When true, verbose per-cycle / per-packet diagnostic prints are emitted.
 // Error and important state messages are always printed regardless.
-// NOTE: do NOT name this `DEBUG` — the ClearCore SAM toolchain defines
-// `DEBUG` as a numeric macro on the compiler command line, which would expand
-// here and break the build ("expected unqualified-id before numeric constant").
-const bool DEBUG_LOG = true;
-#define DBG_PRINT(x)   do { if (DEBUG_LOG) Serial.print(x); } while (0)
-#define DBG_PRINTLN(x) do { if (DEBUG_LOG) Serial.println(x); } while (0)
+const bool DEBUG = false;
+#define DBG_PRINT(x)   do { if (DEBUG) Serial.print(x); } while (0)
+#define DBG_PRINTLN(x) do { if (DEBUG) Serial.println(x); } while (0)
+
+// ---- Belt eject configuration ----
+// After the sequence completes, the belt can run at a faster "eject" speed
+// until the reset photoeye (DI-7 / inputPin2) triggers, pushing the tray
+// off the line. Set BELT_EJECT_ENABLED = false to skip eject entirely
+// (belt stops immediately at sequence end, no DI-7 wait).
+const bool          BELT_EJECT_ENABLED      = true;
+const int           BELT_EJECT_VELOCITY     = 14000;
+const unsigned long BELT_EJECT_TIMEOUT_MS   = 60000; // safety cap on DI-7 wait
 
 // ---- UDP telemetry ----
 // Telemetry uses a SEPARATE UDP socket from the TCP control channel to avoid
@@ -78,12 +81,14 @@ struct TelemetryState {
     uint32_t seq;
     uint32_t lastStatusMs;
     uint32_t lastRxCmdMs;
+    uint32_t faultCountBelt;
     uint32_t faultCountHopper;
     uint32_t udpSendFailCount;
+    bool     lastBeltFault;
     bool     lastHopperFault;
-    uint32_t hopperMotorUptimeMs; // cumulative roller run time since boot, accrued
-                                  // deterministically from each commanded run window
-    uint32_t traysProcessed;       // number of completed sequences since boot
+    uint32_t beltMotorUptimeMs;   // millis() when belt started moving (0 = idle)
+    uint32_t hopperMotorUptimeMs; // millis() when hopper started moving (0 = idle)
+    uint32_t sequenceCount;       // number of completed sequences since boot
 };
 TelemetryState t;
 
@@ -95,11 +100,11 @@ TelemetryState t;
 
 float tray_length = 0.5302; // meters
 
-float distance_irrigation_start = 0.635-tray_length - .1;
+float distance_irrigation_start = 0.635-tray_length;
 float distance_roller_start = 0.8382 - tray_length - 0.06; // 0.196
 float distance_misting_start = 0.9398 - tray_length; //0.3302
 
-float distance_irrigation_end = distance_irrigation_start + tray_length;
+float distance_irrigation_end = distance_irrigation_start + tray_length - 0.1;
 float distance_roller_end = distance_roller_start + tray_length + 0.01;
 float distance_misting_end = distance_misting_start + tray_length - 0.06;
 
@@ -115,6 +120,34 @@ void printSequenceTimes(float irrigation_start, float roller_start, float mistin
     DBG_PRINT("Misting End: ");      DBG_PRINTLN(misting_end);
 }
 
+bool BeltMoveVelocity(int velocity) {
+    velocity = -abs(velocity);
+    if (BeltMotor.StatusReg().bit.AlertsPresent) {
+        Serial.println("Motor alert detected.");
+        PrintAlerts();
+        SendEvent("BELT_FAULT", (int32_t)EncodeBeltAlerts());
+        t.faultCountBelt++;
+        if(HANDLE_ALERTS){
+            HandleAlerts();
+        } else {
+            Serial.println("Enable automatic alert handling by setting HANDLE_ALERTS to 1.");
+        }
+        Serial.println("Move canceled.");
+        return false;
+    }
+    BeltMotor.MoveVelocity(velocity);
+    // Track motor-running uptime for telemetry: 0 commanded → idle.
+    if (velocity == 0) {
+        t.beltMotorUptimeMs = 0;
+    } else if (t.beltMotorUptimeMs == 0) {
+        t.beltMotorUptimeMs = millis();
+    }
+    while (!BeltMotor.StatusReg().bit.AtTargetVelocity) {
+        continue;
+    }
+    return true;
+}
+
 // Empirical scale: roller mechanism needs ~3x the commanded velocity to
 // produce the desired seed-roller surface speed (tuned on bench).
 static const int HOPPER_VELOCITY_GAIN = 3;
@@ -124,7 +157,7 @@ bool HopperMoveVelocity(int velocity) {
     if (HopperMotor.StatusReg().bit.AlertsPresent) {
         Serial.println("Motor alert detected.");
         PrintAlerts();
-        SendEvent("FAULT_ROLLER", "roller");
+        SendEvent("HOPPER_FAULT", (int32_t)EncodeHopperAlerts());
         t.faultCountHopper++;
         if(HANDLE_ALERTS){
             HandleAlerts();
@@ -137,11 +170,12 @@ bool HopperMoveVelocity(int velocity) {
     // Non-blocking: command the velocity and return. Busy-waiting on
     // AtTargetVelocity here would stall loop() and skew sequence timing,
     // especially when ramping down to 0 at roller-end.
-    // NOTE: roller run time is NOT tracked here. Because the roller runs in
-    // short bursts between telemetry samples, reading elapsed-since-start almost
-    // always caught it idle. Instead we accrue the deterministic run window
-    // (rollerEnd - rollerStart) once per sequence where the roller commits.
     HopperMotor.MoveVelocity(HOPPER_VELOCITY_GAIN * velocity);
+    if (velocity == 0) {
+        t.hopperMotorUptimeMs = 0;
+    } else if (t.hopperMotorUptimeMs == 0) {
+        t.hopperMotorUptimeMs = millis();
+    }
     return true;
 }
 
@@ -267,8 +301,43 @@ void parseReceivedMessage(char *message) {
     
 }
 
+// Pack the six alert-register bits into a uint16_t for compact telemetry.
+static uint16_t EncodeBeltAlerts() {
+    uint16_t bits = 0;
+    bits |= BeltMotor.AlertReg().bit.MotionCanceledInAlert       ? (1 << 0) : 0;
+    bits |= BeltMotor.AlertReg().bit.MotionCanceledPositiveLimit ? (1 << 1) : 0;
+    bits |= BeltMotor.AlertReg().bit.MotionCanceledNegativeLimit ? (1 << 2) : 0;
+    bits |= BeltMotor.AlertReg().bit.MotionCanceledSensorEStop   ? (1 << 3) : 0;
+    bits |= BeltMotor.AlertReg().bit.MotionCanceledMotorDisabled ? (1 << 4) : 0;
+    bits |= BeltMotor.AlertReg().bit.MotorFaulted                ? (1 << 5) : 0;
+    return bits;
+}
+
+static uint16_t EncodeHopperAlerts() {
+    uint16_t bits = 0;
+    bits |= HopperMotor.AlertReg().bit.MotionCanceledInAlert       ? (1 << 0) : 0;
+    bits |= HopperMotor.AlertReg().bit.MotionCanceledPositiveLimit ? (1 << 1) : 0;
+    bits |= HopperMotor.AlertReg().bit.MotionCanceledNegativeLimit ? (1 << 2) : 0;
+    bits |= HopperMotor.AlertReg().bit.MotionCanceledSensorEStop   ? (1 << 3) : 0;
+    bits |= HopperMotor.AlertReg().bit.MotionCanceledMotorDisabled ? (1 << 4) : 0;
+    bits |= HopperMotor.AlertReg().bit.MotorFaulted                ? (1 << 5) : 0;
+    return bits;
+}
+
 void PrintAlerts() {
     Serial.println("Alerts present: ");
+    if(BeltMotor.AlertReg().bit.MotionCanceledInAlert){
+        Serial.println("    BeltMotor: MotionCanceledInAlert "); }
+    if(BeltMotor.AlertReg().bit.MotionCanceledPositiveLimit){
+        Serial.println("    BeltMotor: MotionCanceledPositiveLimit "); }
+    if(BeltMotor.AlertReg().bit.MotionCanceledNegativeLimit){
+        Serial.println("    BeltMotor: MotionCanceledNegativeLimit "); }
+    if(BeltMotor.AlertReg().bit.MotionCanceledSensorEStop){
+        Serial.println("    BeltMotor: MotionCanceledSensorEStop "); }
+    if(BeltMotor.AlertReg().bit.MotionCanceledMotorDisabled){
+        Serial.println("    BeltMotor: MotionCanceledMotorDisabled "); }
+    if(BeltMotor.AlertReg().bit.MotorFaulted){
+        Serial.println("    BeltMotor: MotorFaulted "); }
     if(HopperMotor.AlertReg().bit.MotionCanceledInAlert){
         Serial.println("    HopperMotor: MotionCanceledInAlert "); }
     if(HopperMotor.AlertReg().bit.MotionCanceledPositiveLimit){
@@ -284,6 +353,12 @@ void PrintAlerts() {
 }
 
 void HandleAlerts() {
+    if(BeltMotor.AlertReg().bit.MotorFaulted){
+        Serial.println("BeltMotor faults detected. Resetting...");
+        BeltMotor.EnableRequest(false);
+        delay(10);
+        BeltMotor.EnableRequest(true);
+    }
     if(HopperMotor.AlertReg().bit.MotorFaulted){
         Serial.println("HopperMotor faults detected. Resetting...");
         HopperMotor.EnableRequest(false);
@@ -291,6 +366,7 @@ void HandleAlerts() {
         HopperMotor.EnableRequest(true);
     }
     Serial.println("Clearing alerts.");
+    BeltMotor.ClearAlerts();
     HopperMotor.ClearAlerts();
 }
 
@@ -306,31 +382,45 @@ void SendStatusUpdate() {
     }
     char telemetryBuffer[256];
     uint32_t uptimeMs = millis();
+    bool beltFault    = BeltMotor.StatusReg().bit.AlertsPresent;
+    bool hopperFault  = HopperMotor.StatusReg().bit.AlertsPresent;
+    uint16_t beltAlertBits   = EncodeBeltAlerts();
+    uint16_t hopperAlertBits = EncodeHopperAlerts();
+    int di6 = digitalRead(inputPin1) ? 1 : 0;
+    int di7 = digitalRead(inputPin2) ? 1 : 0;
+    int rel0 = digitalRead(relay0Pin) ? 1 : 0;
+    int rel1 = digitalRead(relay1Pin) ? 1 : 0;
     uint32_t cmdAgeMs = uptimeMs - t.lastRxCmdMs;
     uint32_t seq = ++t.seq;
 
-    uint32_t hopperUptime = t.hopperMotorUptimeMs; // cumulative deterministic roller run time
+    uint32_t beltUptime   = t.beltMotorUptimeMs   ? (uptimeMs - t.beltMotorUptimeMs)   : 0;
+    uint32_t hopperUptime = t.hopperMotorUptimeMs ? (uptimeMs - t.hopperMotorUptimeMs) : 0;
 
-    // Format (schema_ver 2): STATUS_UPDATE,2,bootId,seq,uptimeMs,
-    //   belt_motor_uptime_ms,roller_motor_uptime_ms,cmdAgeMs,udpFails,
-    //   trays_processed,varietyId,varietyName
-    // hopperUptime maps to roller_motor_uptime_ms (hopper = roller); it is a
-    // cumulative total of commanded run windows since boot.
-    // belt_motor_uptime_ms is retained as a fixed 0 placeholder: this controller
-    // no longer drives the belt (external VFD), but the field is kept so the
-    // schema_ver 2 wire format the receiver parses stays byte-compatible.
+    // Format: STATUS_UPDATE,ver,bootId,seq,uptimeMs,beltUptime,hopperUptime,
+    //         beltFault,hopperFault,beltAlerts,hopperAlerts,sequenceActive,
+    //         readyToRun,beltRpm,hopperRpm,di6,di7,rel0,rel1,cmdAgeMs,
+    //         udpFails,sequenceCount,varietyId,varietyName
     // varietyName is LAST so any snprintf truncation chops the name, not
     // the structured numeric tail.
     snprintf(telemetryBuffer, sizeof(telemetryBuffer),
-             "STATUS_UPDATE,2,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%d,%s",
+             "STATUS_UPDATE,1,%lu,%lu,%lu,%lu,%lu,%d,%d,%u,%u,%d,%d,%d,%d,%d,%d,%d,%d,%lu,%lu,%lu,%d,%s",
              (unsigned long)t.bootId,
              (unsigned long)seq,
              (unsigned long)uptimeMs,
-             (unsigned long)0,   // belt_motor_uptime_ms — placeholder (belt not driven)
+             (unsigned long)beltUptime,
              (unsigned long)hopperUptime,
+             beltFault ? 1 : 0,
+             hopperFault ? 1 : 0,
+             (unsigned int)beltAlertBits,
+             (unsigned int)hopperAlertBits,
+             sequenceActive ? 1 : 0,
+             ready_to_run_flag ? 1 : 0,
+             (int)user_belt_rpm,
+             (int)user_hopper_rpm,
+             di6, di7, rel0, rel1,
              (unsigned long)cmdAgeMs,
              (unsigned long)t.udpSendFailCount,
-             (unsigned long)t.traysProcessed,
+             (unsigned long)t.sequenceCount,
              activeVarietyId,
              activeVarietyName);
 
@@ -341,11 +431,11 @@ void SendStatusUpdate() {
     }
 }
 
-// Lightweight fault ping — emit once on the fault edge (0->1), not every
-// cycle. Receiver joins with the nearest STATUS_UPDATE on (bootId, uptimeMs)
-// for full state at event time. eventCode must start with "FAULT_"; motor
-// attributes the fault ("belt" or "roller").
-void SendEvent(const char *eventCode, const char *motor) {
+// Lightweight event ping — only used for faults and timeouts.
+// Motor/source identity goes in the eventCode string (e.g. "BELT_FAULT",
+// "HOPPER_FAULT", "DI7_TIMEOUT"). Receiver can join with nearest
+// STATUS_UPDATE on (bootId, uptimeMs) for full state at event time.
+void SendEvent(const char *eventCode, int32_t value) {
     if (Ethernet.linkStatus() != LinkON) {
         return;
     }
@@ -353,15 +443,15 @@ void SendEvent(const char *eventCode, const char *motor) {
     uint32_t uptimeMs = millis();
     uint32_t seq = ++t.seq;
 
-    // Format (schema_ver 2): EVENT,2,bootId,seq,uptimeMs,eventCode,eventValue,motor
+    // Format: EVENT,ver,bootId,seq,uptimeMs,eventCode,value,udpFails
     snprintf(telemetryBuffer, sizeof(telemetryBuffer),
-             "EVENT,2,%lu,%lu,%lu,%s,%d,%s",
+             "EVENT,1,%lu,%lu,%lu,%s,%ld,%lu",
              (unsigned long)t.bootId,
              (unsigned long)seq,
              (unsigned long)uptimeMs,
              eventCode,
-             1,
-             motor);
+             (long)value,
+             (unsigned long)t.udpSendFailCount);
 
     Udp.beginPacket(serverIp, remotePort);
     Udp.write((const uint8_t *)telemetryBuffer, strlen(telemetryBuffer));
@@ -373,7 +463,6 @@ void SendEvent(const char *eventCode, const char *motor) {
 void setup() {
     pinMode(relay0Pin, OUTPUT);
     pinMode(relay1Pin, OUTPUT);
-    pinMode(relay2Pin, OUTPUT);
     pinMode(inputPin1, INPUT);
     pinMode(inputPin2, INPUT);
 
@@ -390,19 +479,33 @@ void setup() {
         delay(1000);
     }
 
-    // Serial.println("[line-framed-v2] firmware boot");
-    // if (client.connect(serverIp, PORT_NUM)) {
-    //     Serial.println("Connected to server.");
-    // } else {
-    //     Serial.println("Failed to connect to server.");
-    // }
+    if (client.connect(serverIp, PORT_NUM)) {
+        Serial.println("Connected to server.");
+    } else {
+        Serial.println("Failed to connect to server.");
+    }  
 
     /////////////////////////////////////////////////////////
     /////////////        Motor Set Up           /////////////
     /////////////////////////////////////////////////////////
     MotorMgr.MotorModeSet(MotorManager::MOTOR_ALL, Connector::CPM_MODE_STEP_AND_DIR);
-    // Belt motor (M0) intentionally not enabled — the conveyor is driven by an
-    // external VFD, not this controller. Only the hopper/roller motor is managed.
+    BeltMotor.HlfbMode(MotorDriver::HLFB_MODE_HAS_BIPOLAR_PWM);
+    BeltMotor.HlfbCarrier(MotorDriver::HLFB_CARRIER_482_HZ);
+    BeltMotor.AccelMax(accelerationLimit);
+    BeltMotor.EnableRequest(true);
+    Serial.println("BeltMotor Enabled");
+
+    uint32_t enableStartTime = millis();
+    while (BeltMotor.HlfbState() != MotorDriver::HLFB_ASSERTED &&
+            !BeltMotor.StatusReg().bit.AlertsPresent &&
+            millis() - enableStartTime < 5000) {
+        continue;
+    }
+    if (BeltMotor.StatusReg().bit.AlertsPresent) {
+        if (HANDLE_ALERTS) HandleAlerts();
+    } else {
+        Serial.println("BeltMotor Ready");
+    }
 
     // Hopper Motor Setup
     HopperMotor.HlfbMode(MotorDriver::HLFB_MODE_HAS_BIPOLAR_PWM);
@@ -430,11 +533,14 @@ void setup() {
     t.seq                 = 0;
     t.lastStatusMs        = 0;
     t.lastRxCmdMs         = millis();
+    t.faultCountBelt      = 0;
     t.faultCountHopper    = 0;
     t.udpSendFailCount    = 0;
+    t.lastBeltFault       = false;
     t.lastHopperFault     = false;
+    t.beltMotorUptimeMs   = 0;
     t.hopperMotorUptimeMs = 0;
-    t.traysProcessed       = 0;
+    t.sequenceCount       = 0;
 
     Udp.begin(UDP_LOCAL_PORT);
     Serial.println("UDP telemetry initialized");
@@ -452,50 +558,13 @@ void loop() {
           client.stop();
           client.connect(serverIp, PORT_NUM);
       }
-  } else {
-      // The Pi server holds the connection open and pushes a newline-terminated
-      // CSV whenever state changes, plus a periodic heartbeat (~10s). Frame on
-      // '\n' so multi-packet or split reads don't corrupt the CSV field split,
-      // and skip-parse if the snapshot matches the last one we parsed — that
-      // makes the heartbeat free and gives us defense-in-depth against any
-      // future server that pushes redundant updates.
-      static char   lineBuf[MAX_PACKET_LENGTH];
-      static char   lastLine[MAX_PACKET_LENGTH];  // zero-init by static
-      static size_t lineLen = 0;
-      while (client.available() > 0) {
-          int c = client.read();
-          if (c < 0) break;
-          if (c == '\r') continue;                       // tolerate CRLF
-          if (c == '\n') {
-              if (lineLen > 0) {
-                  lineBuf[lineLen] = '\0';
-                  if (strcmp(lineBuf, lastLine) != 0) {
-                      // Cache BEFORE parse — parseReceivedMessage uses strtok
-                      // which mutates lineBuf in place.
-                      memcpy(lastLine, lineBuf, lineLen + 1);
-                      parseReceivedMessage(lineBuf);
-                  }
-              }
-              lineLen = 0;
-          } else if (lineLen < sizeof(lineBuf) - 1) {
-              lineBuf[lineLen++] = (char)c;
-          } else {
-              // Overflow without a delimiter — drop the partial line and
-              // resync on the next '\n'. Should never happen with the current
-              // ~80-byte payload.
-              lineLen = 0;
-          }
+  } else if (client.available() > 0) {
+      int len = client.read(packetReceived, MAX_PACKET_LENGTH - 1);
+      if (len > 0) {
+          packetReceived[len] = '\0';
+          parseReceivedMessage((char *)packetReceived);
       }
   }
-
-  ////////////////////////////////////////////////////////////
-  //////////////// Belt Speed (timing input only) /////////////
-  ////////////////////////////////////////////////////////////
-  // This machine no longer drives the conveyor belt. The belt is run by an
-  // external VFD pre-programmed with fixed speed settings; the operator
-  // selects one on the VFD and enters the matching speed on the Touch Encoder.
-  // We take user_belt_rpm purely as an INPUT to the sequence-timing math below
-  // (distance / belt_speed) and issue no BeltMoveVelocity commands.
 
   ////////////////////////////////////////////////////////////
   //////////////// Calculate Motor Speed //////////////////////
@@ -535,53 +604,18 @@ void loop() {
   ////////////////////////////////////////////////////////////
 
   bool inputState = digitalRead(inputPin1);
-  static bool lastPhotoeyeState = false;
 
-  // Roller-start gate state (reset each sequence). The roller is committed once
-  // per sequence at roller-start and latched — see the roller block below.
-  static bool rollerGateEvaluated = false;
-  static bool rollerAllowed       = false;
-  // Set on the photoeye falling edge if the tray blocked the beam long enough
-  // to be a real tray (vs a noise/debris false trigger). Gates traysProcessed.
-  static bool trayBlockValid      = false;
-
-  // Rising-edge only: a tray that's still parked in front of the photoeye
-  // when the previous sequence ends must not immediately re-fire — wait for
-  // it to clear and a new tray to arrive. Refuse to start without a valid
-  // belt speed (clamped/zero speed produces nonsense timings).
-  if (inputState && !lastPhotoeyeState && !sequenceActive && ready_to_run_flag && belt_speed_valid) {
+  // Refuse to start a sequence without a valid belt speed — running with a
+  // clamped/zero speed produces nonsense timings.
+  if (inputState && !sequenceActive && ready_to_run_flag && belt_speed_valid) {
+      // If DI-6 is triggered and sequence is not already running, start stopwatch
       startTime = millis();
       sequenceActive = true;
-      rollerGateEvaluated = false;
-      rollerAllowed       = false;
-      trayBlockValid      = false;
-      DBG_PRINTLN("Photoeye rising edge: Starting event sequence.");
-  }
+      DBG_PRINTLN("DI-6 triggered: Starting event sequence.");
 
-  // Falling edge: tray trailing edge has cleared the photoeye. Measure how long
-  // the beam was blocked and decide locally whether this was a real tray. We
-  // use the same belt_speed time-base the sequence timings use, so any scaling
-  // cancels. The lower bound is deliberately generous (MIN_TRAY_BLOCK_FRACTION
-  // of the expected full-tray block time) so smaller or larger trays still
-  // count — only brief noise/debris false triggers are rejected. This only
-  // gates the local traysProcessed counter; no new data is sent to the Pi.
-  //
-  // Scale the expected block time by any roller-duration extension the user
-  // dialed in: a longer roller duration implies a longer tray, which blocks the
-  // beam proportionally longer. user_roller_end_mod_value*100 is already in ms
-  // (same units as the timing math), so it adds directly. Only extend, never
-  // shorten, the expected window.
-  static const float MIN_TRAY_BLOCK_FRACTION = 0.3f;
-  if (!inputState && lastPhotoeyeState && sequenceActive && belt_speed_valid) {
-      unsigned long blockMs = millis() - startTime;
-      float rollerDurationExtraMs = user_roller_end_mod_value > 0.0f
-                                        ? user_roller_end_mod_value * 100.0f
-                                        : 0.0f;
-      float expectedBlockMs = (tray_length / belt_speed) * 1000.0f + rollerDurationExtraMs;
-      trayBlockValid = (expectedBlockMs > 0.0f) &&
-                       ((float)blockMs >= MIN_TRAY_BLOCK_FRACTION * expectedBlockMs);
+      // Run belt motor immediately
+      BeltMoveVelocity(user_belt_rpm);  // Example values: 100 RPM
   }
-  lastPhotoeyeState = inputState;
 
   if (sequenceActive) {
       unsigned long elapsedTime = millis() - startTime;
@@ -603,32 +637,8 @@ void loop() {
       }
 
       if (elapsedTime >= rollerStartMs && elapsedTime < rollerEndMs) {
-          // Roller-start gate: only commit the roller if the tray is STILL
-          // blocking the photoeye at roller-start. A real tray (~0.53 m) is
-          // much longer than the sensor->roller distance (~0.25 m), so it must
-          // still cover the beam here. If it doesn't, the rising edge was a
-          // false trigger (noise/debris/short object) and we suppress the
-          // roller for this sequence to avoid dispensing onto bare belt.
-          // Evaluate ONCE at roller-start, then latch — do NOT gate on live
-          // photoeye state, since a real tray legitimately clears the beam
-          // (~0.53 m) well before roller-end (~0.79 m).
-          if (!rollerGateEvaluated) {
-              rollerGateEvaluated = true;
-              rollerAllowed = inputState;
-              if (rollerAllowed) {
-                  // Accrue the deterministic run window once, here at commit.
-                  // The roller runs rollerStart..rollerEnd unconditionally from
-                  // this point, so this equals the actual run time.
-                  if (rollerEndMs > rollerStartMs) {
-                      t.hopperMotorUptimeMs += (uint32_t)(rollerEndMs - rollerStartMs);
-                  }
-              } else {
-                  DBG_PRINTLN("Roller suppressed: photoeye cleared before roller-start (likely false trigger).");
-              }
-          }
-          if (rollerAllowed) {
-              HopperMoveVelocity(user_hopper_rpm);  // Example values: 100 RPM
-          }
+          // Serial.println("Roller ON (Function Call Would Happen Here)");
+          HopperMoveVelocity(user_hopper_rpm);  // Example values: 100 RPM
 
       } else if (elapsedTime >= rollerEndMs) {
           // Serial.println("Roller OFF");
@@ -645,29 +655,28 @@ void loop() {
       }
 
       if (elapsedTime >= irrigationEndMs && elapsedTime >= rollerEndMs && elapsedTime >= mistingEndMs) {
-          sequenceActive = false;
-          // Only count real trays. Either the trailing edge cleared the beam
-          // long enough to validate (trayBlockValid), or the tray is still over
-          // the photoeye at sequence end (a tray longer than the sequence
-          // window) — both are real trays. A brief false trigger validates as
-          // neither and is not counted.
-          if (trayBlockValid || inputState) {
-              t.traysProcessed++;
-          }
-      }
-  }
+          if (BELT_EJECT_ENABLED) {
+              DBG_PRINTLN("Waiting for DI-7 trigger to stop belt...");
+              BeltMoveVelocity(BELT_EJECT_VELOCITY);
 
-  ////////////////////////////////////////////////////////////
-  /////////// Second Laser Gate -> Third Solenoid /////////////
-  ////////////////////////////////////////////////////////////
-  // Fully independent of the tray sequence above. The third solenoid simply
-  // mirrors the second laser gate in real time: beam blocked/triggered -> ON,
-  // clear -> OFF. No delays, no timing math, and NOT gated by ready_to_run.
-  // Assumes the second gate reads HIGH when triggered, matching inputPin1's
-  // convention. If this gate is wired active-low, invert the read below.
-  {
-      bool gate2Triggered = digitalRead(inputPin2);
-      digitalWrite(relay2Pin, gate2Triggered ? HIGH : LOW);
+              unsigned long ejectStart = millis();
+              bool resetTriggered = false;
+              while (millis() - ejectStart < BELT_EJECT_TIMEOUT_MS) {
+                  if (digitalRead(inputPin2)) { resetTriggered = true; break; }
+                  delay(10);
+              }
+              if (!resetTriggered) {
+                  Serial.println("WARNING: DI-7 timeout — stopping belt anyway.");
+                  SendEvent("DI7_TIMEOUT", (int32_t)(millis() - ejectStart));
+              }
+              delay(500);
+          } else {
+              DBG_PRINTLN("Belt eject disabled — stopping at sequence end.");
+          }
+          BeltMoveVelocity(0);
+          sequenceActive = false;
+          t.sequenceCount++;
+      }
   }
 
   // Periodic telemetry — fire-and-forget, time-guarded so a slow socket

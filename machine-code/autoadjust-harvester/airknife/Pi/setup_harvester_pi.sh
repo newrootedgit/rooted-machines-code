@@ -85,8 +85,8 @@ network:
         wlan0:
             dhcp4: yes
             access-points:
-                "urbanfarms":
-                    password: "RoboticFarming"
+                "<WIFI_SSID>":
+                    password: "<WIFI_PASSWORD>"
 NETPLAN
 run_with_timeout 30 sudo netplan apply
 sudo ip link set wlan0 up || true

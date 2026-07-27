@@ -18,7 +18,7 @@ Flash MicroSD
 5) Use custom settings to enable SSH
 6) No need to provide Wi-Fi login info
 7) Username: rooted
-8) Password: ck9dmt5s1
+8) Password: <PI_PASSWORD>
 9) Remove SD
 
 ----------------------------------------
@@ -121,8 +121,8 @@ network:
         wlan0:
             dhcp4: yes
             access-points:
-                "urbanfarms":
-                    password: "RoboticFarming"
+                "<WIFI_SSID>":
+                    password: "<WIFI_PASSWORD>"
 ```
 
 Apply:
