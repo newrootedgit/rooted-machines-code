@@ -16,7 +16,8 @@ int accelerationLimit = 100000; // pulses per sec^2
 ///////////////////////////// Pin Map ///////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////
 // Two laser gates (inputs) and three solenoids (outputs).
-// Laser gates read HIGH when the beam is broken (object present = triggered).
+// Laser gates read LOW when the beam is broken (object present = triggered).
+// Solenoid outputs are driven HIGH to energize. See the polarity defines below.
 
 #define laserGateMain    IO1  // Main sequence trigger
 #define laserGateTopcoat IO0  // Topcoat trigger
@@ -24,6 +25,19 @@ int accelerationLimit = 100000; // pulses per sec^2
 #define irrigationPin    IO2  // Main-sequence irrigation solenoid
 #define topcoatPin       IO3  // Topcoat irrigation solenoid (follows IO0)
 #define mistingPin       IO4  // Main-sequence misting solenoid
+
+// Solenoid drive polarity. The valve drivers on this machine are ACTIVE HIGH:
+// driving the output HIGH energizes the coil (valve opens), LOW releases it.
+// LOW is therefore the safe/default state and what the pins hold at boot.
+// Always write SOL_ON / SOL_OFF to the solenoid pins — never raw HIGH/LOW —
+// so a rewire is a one-line change here.
+#define SOL_ON   HIGH
+#define SOL_OFF  LOW
+
+// Laser gate polarity. The gates are ACTIVE LOW: the input reads HIGH while the
+// beam is intact and drops LOW when the beam is broken (object present). Read
+// them through GATE_TRIGGERED() rather than testing digitalRead() directly.
+#define GATE_TRIGGERED(pin)  (digitalRead(pin) == LOW)
 
 byte mac[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED};  // MAC address
 IPAddress ip(192, 168, 10, 2);                      // Static IP
@@ -328,9 +342,9 @@ void setup() {
     pinMode(irrigationPin, OUTPUT);
     pinMode(topcoatPin,    OUTPUT);
     pinMode(mistingPin,    OUTPUT);
-    digitalWrite(irrigationPin, LOW);
-    digitalWrite(topcoatPin,    LOW);
-    digitalWrite(mistingPin,    LOW);
+    digitalWrite(irrigationPin, SOL_OFF);
+    digitalWrite(topcoatPin,    SOL_OFF);
+    digitalWrite(mistingPin,    SOL_OFF);
 
     Serial.begin(9600);
 
@@ -436,16 +450,48 @@ void loop() {
   ////////////////////////////////////////////////////////////
   ////////////////// Read Laser Gates /////////////////////////
   ////////////////////////////////////////////////////////////
-  // HIGH = beam broken = triggered.
-  bool mainGate    = digitalRead(laserGateMain);
-  bool topcoatGate = digitalRead(laserGateTopcoat);
+  // Active low: the pin sits HIGH with the beam intact and goes LOW when the
+  // beam is broken. mainGate/topcoatGate are true when the beam IS broken.
+  bool mainGate    = GATE_TRIGGERED(laserGateMain);
+  bool topcoatGate = GATE_TRIGGERED(laserGateTopcoat);
+
+  ////////////////////////////////////////////////////////////
+  ////////////// Arm / Disarm Gate Inhibit ////////////////////
+  ////////////////////////////////////////////////////////////
+  // OFF is the default state of this machine. A laser gate may only energize a
+  // solenoid while ready_to_run is active, AND only after that gate has been
+  // seen CLEAR at least once since arming. Without the second condition, a beam
+  // that happens to be blocked at the moment the operator arms (tray sitting in
+  // the gate, misaligned emitter, hand in the beam) fires the valves instantly
+  // on the arm edge — which is the "toggling ready_to_run opens the solenoids"
+  // behavior. Requiring a fresh clear->blocked edge means only a real tray
+  // passing through can trigger a cycle.
+  static bool prevReady          = false;
+  static bool mainGateInhibit    = false;
+  static bool topcoatGateInhibit = false;
+
+  if (ready_to_run_flag && !prevReady) {
+      // Arm edge: whatever the gates read right now does not count as a trigger.
+      mainGateInhibit    = mainGate;
+      topcoatGateInhibit = topcoatGate;
+      if (mainGateInhibit || topcoatGateInhibit) {
+          DBG_PRINTLN("Armed with a gate already blocked: ignoring until it clears.");
+      }
+  }
+  prevReady = ready_to_run_flag;
+
+  // A gate is released from inhibit as soon as it reads clear.
+  if (!mainGate)    mainGateInhibit    = false;
+  if (!topcoatGate) topcoatGateInhibit = false;
+
+  bool mainTriggered    = ready_to_run_flag && mainGate    && !mainGateInhibit;
+  bool topcoatTriggered = ready_to_run_flag && topcoatGate && !topcoatGateInhibit;
 
   ////////////////////////////////////////////////////////////
   /////////// Topcoat Irrigation (IO0 -> IO3) /////////////////
   ////////////////////////////////////////////////////////////
-  // Pure level-follow, no delays: solenoid mirrors the gate. Gated by
-  // ready_to_run_flag so nothing energizes when the machine isn't armed.
-  digitalWrite(topcoatPin, (ready_to_run_flag && topcoatGate) ? HIGH : LOW);
+  // Pure level-follow, no delays: solenoid mirrors the (inhibit-filtered) gate.
+  bool topcoatOn = topcoatTriggered;
 
   ////////////////////////////////////////////////////////////
   ///////// Main Sequence (IO1 -> hopper + IO2 + IO4) /////////
@@ -453,32 +499,33 @@ void loop() {
   // While the main gate is triggered, the hopper/irrigation/misting run. When
   // the gate clears, a shutoff timer (selected by VFD speed) keeps them running
   // for the coast-down before turning everything off together.
+  bool mainOn = false;   // drives irrigation + misting
   {
       static bool          mainOutputsOn   = false;
       static bool          shutoffPending  = false;
       static unsigned long shutoffStartMs  = 0;
       static uint32_t      hopperOnStartMs = 0;
 
-      // Force everything off if the machine gets disarmed mid-run.
+      // Force everything off if the machine gets disarmed mid-run. This clears
+      // ALL latched state unconditionally — not just on the falling edge — so a
+      // disarmed machine can never be left holding a pending shutoff timer or a
+      // stale "outputs are on" flag that would resurface on the next arm.
       if (!ready_to_run_flag) {
           if (mainOutputsOn) {
-              digitalWrite(irrigationPin, LOW);
-              digitalWrite(mistingPin,    LOW);
               HopperMoveVelocity(0);
               if (hopperOnStartMs) {
                   t.hopperMotorUptimeMs += millis() - hopperOnStartMs;
                   hopperOnStartMs = 0;
               }
-              mainOutputsOn = false;
+              DBG_PRINTLN("Disarmed: sequence forced OFF.");
           }
+          mainOutputsOn  = false;
           shutoffPending = false;
       } else {
-          if (mainGate) {
+          if (mainTriggered) {
               // Triggered: ensure outputs are on, cancel any pending shutoff.
               shutoffPending = false;
               if (!mainOutputsOn) {
-                  digitalWrite(irrigationPin, HIGH);
-                  digitalWrite(mistingPin,    HIGH);
                   HopperMoveVelocity(user_hopper_rpm);
                   hopperOnStartMs = millis();
                   mainOutputsOn = true;
@@ -495,8 +542,6 @@ void loop() {
               }
               if (shutoffPending &&
                   (millis() - shutoffStartMs >= currentShutoffDelayMs())) {
-                  digitalWrite(irrigationPin, LOW);
-                  digitalWrite(mistingPin,    LOW);
                   HopperMoveVelocity(0);
                   if (hopperOnStartMs) {
                       t.hopperMotorUptimeMs += millis() - hopperOnStartMs;
@@ -509,7 +554,24 @@ void loop() {
               }
           }
       }
+
+      mainOn = mainOutputsOn;
   }
+
+  ////////////////////////////////////////////////////////////
+  ///////////////// Drive Solenoid Outputs ////////////////////
+  ////////////////////////////////////////////////////////////
+  // Single write point for all three valves, re-asserted EVERY pass from the
+  // state computed above rather than only on transitions. Outputs therefore
+  // cannot be left latched in the wrong state by any path through the logic,
+  // and `ready_to_run_flag` false forces all three OFF here on every iteration.
+  if (!ready_to_run_flag) {
+      topcoatOn = false;
+      mainOn    = false;
+  }
+  digitalWrite(topcoatPin,    topcoatOn ? SOL_ON : SOL_OFF);
+  digitalWrite(irrigationPin, mainOn    ? SOL_ON : SOL_OFF);
+  digitalWrite(mistingPin,    mainOn    ? SOL_ON : SOL_OFF);
 
   // Periodic telemetry — fire-and-forget, time-guarded so a slow socket
   // surfaces as a warning instead of silently skewing the control loop.
