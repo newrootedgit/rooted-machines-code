@@ -187,19 +187,16 @@ def force_ready_to_run_false() -> None:
     persisted from a previous session is streamed to the motor the instant the
     ClearCore connects, before the poll process clears it (the "brief startup
     twitch"). A control-bridge (re)start must always fail safe to stopped.
+
+    Goes through _locked_merge_json so the write is ATOMIC. This used to do an
+    in-place open(path, "w"), which truncates the file before writing it back —
+    and it runs on every startup, i.e. exactly when someone is power-cycling the
+    machine. A cut in that window left a half-written file, which reads back as
+    a JSONDecodeError, which silently becomes an empty dict, which loses every
+    variety preset on the machine. Never rewrite this file non-atomically.
     """
     try:
-        with FileLock(LOCK_FILE_PATH, shared=False):
-            try:
-                with open(JSON_FILE_PATH, "r") as f:
-                    data = json.load(f)
-            except (FileNotFoundError, json.JSONDecodeError):
-                data = {}
-            if data.get("ready_to_run", False):
-                data["ready_to_run"] = False
-                with open(JSON_FILE_PATH, "w") as f:
-                    json.dump(data, f, indent=4)
-                print("tcp: startup fail-safe - cleared stale ready_to_run")
+        _locked_merge_json({"ready_to_run": False})
     except OSError as e:
         # Never let a startup write hiccup keep the server from coming up.
         print(f"tcp: could not clear ready_to_run at startup: {e}")
@@ -255,6 +252,16 @@ def _locked_merge_json(updates: Dict) -> None:
                 tmpf.flush()
                 os.fsync(tmpf.fileno())
             os.replace(tmp_path, JSON_FILE_PATH)
+            # Make the rename itself durable, not just the file contents — see
+            # the same call in the poll script for why.
+            try:
+                dfd = os.open(dir_name, os.O_RDONLY)
+                try:
+                    os.fsync(dfd)
+                finally:
+                    os.close(dfd)
+            except OSError:
+                pass
         finally:
             if os.path.exists(tmp_path):
                 try:

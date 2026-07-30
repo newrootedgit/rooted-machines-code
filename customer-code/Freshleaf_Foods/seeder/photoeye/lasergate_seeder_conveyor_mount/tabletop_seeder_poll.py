@@ -58,18 +58,33 @@ CAL_STATE_MEASURING = 1
 CAL_STATE_DONE      = 2
 
 # Keep these SHORT — the screen 19 text field clips anything much longer than
-# ~11 characters. "Calibrating" is the longest string here and sets the budget.
+# ~11 characters. "Calibrated" is the longest string here at 10.
 #
-# The waiting state says "Run a tray" rather than "Calibrate" because
-# calibration is NOT a bounded operation: the sketch only measures when the
-# machine is armed AND a tray physically breaks the laser gate. Without that
-# instruction the screen looks hung after the operator presses the button.
+# The screen walks the operator through the whole operation:
+#
+#   arrive          -> "Calibrate"   nothing has been asked for yet
+#   press button    -> "Run Tray"    armed and waiting for a tray
+#   tray in gate    -> "Measuring"   the controller registered the tray
+#   measured        -> "Calibrated"  then bounce back to the variety screen
+#
+# "Calibrate" vs "Run Tray" cannot be told apart from cal_state — both are
+# CAL_STATE_WAITING on an uncalibrated machine. The difference is whether THIS
+# operator has pressed the button, which only poll knows, so the screen is
+# driven by a local session (see cal_ui in the monitor loop) rather than by
+# cal_state alone.
+CAL_TEXT_IDLE      = "Calibrate"   # on arrival, before anything is requested
+CAL_TEXT_UNKNOWN   = "No link"     # controller not reporting
+
+# In-session text, keyed by the controller's reported cal_state.
 CAL_TEXT = {
-    CAL_STATE_WAITING:   "Run a tray",
-    CAL_STATE_MEASURING: "Calibrating",
+    CAL_STATE_WAITING:   "Run Tray",
+    CAL_STATE_MEASURING: "Measuring",
     CAL_STATE_DONE:      "Calibrated",
 }
-CAL_TEXT_UNKNOWN = "No link"
+
+# How long "Calibrated" stays up before the screen returns to variety select.
+# Long enough to read, short enough that nobody wonders if it's stuck.
+CAL_DONE_DWELL_SEC = 2.5
 
 # Give up on an unacknowledged calibration request after this long and drop the
 # flag. The ack is the controller reporting cal_state != DONE; if it never comes
@@ -156,6 +171,119 @@ def ensure_json_exists(path: str):
                         "variety_names": default_names,
                     }, f, indent=4)
 
+def fsync_dir(dir_name: str):
+    """
+    Flush a directory entry so a rename is durable, not just the file contents.
+
+    os.replace() is atomic — a reader never sees a half-written file — but on
+    ext4 the rename itself only reaches the card when the journal commits,
+    which defaults to every 5 seconds. Without this, pulling power seconds
+    after saving a variety can silently roll that save back. The data is never
+    corrupted either way; this closes the window where it's merely lost.
+
+    Best effort: not every platform allows opening a directory (Windows does
+    not), and where it fails the file-level fsync above has still happened.
+    """
+    try:
+        fd = os.open(dir_name, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+def backup_settings(path: str):
+    """
+    Keep a known-good copy of the settings file alongside it.
+
+    Written after a successful variety save — the only time preset CONTENT
+    changes — so the copy always holds a complete, parseable set. Costs one
+    extra ~6 KB write per operator save, which is nothing next to the telemetry
+    stream, and it is the difference between "presets are gone" and "presets are
+    one cp away".
+
+    Atomic for the same reason the main file is: a torn backup is worse than no
+    backup, because it looks like a recovery option and isn't.
+    """
+    backup = path + ".bak"
+    dir_name = os.path.dirname(path)
+    try:
+        with open(path, "rb") as src:
+            blob = src.read()
+        # Refuse to overwrite a good backup with something unparseable.
+        json.loads(blob.decode("utf-8"))
+        fd, tmp_path = tempfile.mkstemp(prefix=".tmpbak_", dir=dir_name)
+        try:
+            with os.fdopen(fd, "wb") as tmpf:
+                tmpf.write(blob)
+                tmpf.flush()
+                os.fsync(tmpf.fileno())
+            os.replace(tmp_path, backup)
+            fsync_dir(dir_name)
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+    except (OSError, ValueError, UnicodeDecodeError) as e:
+        print(f"WARNING: could not back up {path}: {e}")
+
+def recover_settings_if_needed(path: str):
+    """
+    Restore presets from the backup if the live file is unreadable.
+
+    Runs once at startup rather than from the read path: recovery needs an
+    exclusive lock and a well-defined moment, and the machine is not yet doing
+    anything. Without this an unattended machine silently comes up with zero
+    presets and nobody finds out until an operator goes looking for them.
+    """
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r") as f:
+            json.load(f)
+        return  # live file is fine
+    except (OSError, json.JSONDecodeError):
+        pass
+
+    backup = path + ".bak"
+    try:
+        with open(backup, "r") as f:
+            restored = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        print(f"WARNING: {path} is unreadable and no usable backup exists at "
+              f"{backup}. Variety presets will need to be re-entered.")
+        quarantine_corrupt_json(path)
+        return
+
+    quarantine_corrupt_json(path)
+    locked_atomic_write_json(path, restored)
+    varieties = len([k for k in restored if str(k).isdigit()])
+    print(f"RECOVERED {path} from {backup} ({varieties} variety presets restored)")
+
+def quarantine_corrupt_json(path: str):
+    """
+    Preserve a copy of an unparseable settings file, once.
+
+    Copies rather than moves: the machine has to keep running, and the callers
+    all treat a missing file as "start fresh". Only the FIRST corruption is kept
+    — a later good save followed by another corruption would otherwise overwrite
+    the copy that still had the operator's presets in it.
+    """
+    backup = path + ".corrupt"
+    try:
+        if os.path.exists(backup):
+            print(f"WARNING: {path} is unreadable; existing copy at {backup}")
+            return
+        with open(path, "rb") as src, open(backup, "wb") as dst:
+            dst.write(src.read())
+        print(f"WARNING: {path} is unreadable — variety presets may be lost. "
+              f"A copy was kept at {backup} for recovery.")
+    except OSError as e:
+        print(f"WARNING: {path} is unreadable and could not be copied: {e}")
+
 def locked_read_json(path: str) -> Dict:
     with FileLock(LOCK_FILE_PATH, shared=True):
         try:
@@ -164,6 +292,11 @@ def locked_read_json(path: str) -> Dict:
         except FileNotFoundError:
             return {}
         except json.JSONDecodeError:
+            # A damaged file reads as "no presets", and the next save would then
+            # write a fresh file containing only that one variety — turning
+            # recoverable damage into permanent loss. Keep a copy before anyone
+            # overwrites it, and say so loudly rather than failing silently.
+            quarantine_corrupt_json(path)
             return {}
 
 def locked_atomic_write_json(path: str, data: Dict):
@@ -177,6 +310,7 @@ def locked_atomic_write_json(path: str, data: Dict):
                 tmpf.flush()
                 os.fsync(tmpf.fileno())
             os.replace(tmp_path, path)
+            fsync_dir(dir_name)
         finally:
             if os.path.exists(tmp_path):
                 try:
@@ -315,6 +449,8 @@ def save_variety_data(
     }
     locked_atomic_write_json(JSON_FILE_PATH, data)
     print(f"Saved variety {key} to JSON")
+    # Preset content just changed — refresh the known-good copy.
+    backup_settings(JSON_FILE_PATH)
 
 def save_active_variety(variety_index: int):
     data = locked_read_json(JSON_FILE_PATH) or {}
@@ -369,6 +505,23 @@ def expire_calibrate_request(raised_at):
     print("calibrate_request: no controller ack, clearing so the button works again")
     set_calibrate_request(False)
     return None
+
+def new_cal_ui() -> Dict:
+    """
+    Fresh calibration-screen session state.
+
+      started_at  when the operator pressed Calibrate, or None if idle
+      acked       True once the controller confirmed it started over, after
+                  which cal_state describes THIS calibration rather than the
+                  previous one
+      done_at     when "Calibrated" first went up, for the dwell before we
+                  return the operator to the variety screen
+
+    Deliberately survives navigating away from screen 19 — the operator usually
+    has to walk to the machine to run the tray, and should come back to live
+    progress rather than a reset screen.
+    """
+    return {"started_at": None, "acked": False, "done_at": None}
 
 def resolve_calibration_autoarm(armed_at):
     """
@@ -501,6 +654,10 @@ def monitor_touch_encoder_loop():
     # When we armed the machine on the operator's behalf for a calibration, so
     # we know to hand it back to paused when the calibration lands.
     cal_autoarm_at = None
+
+    # Calibration screen session — drives the Calibrate/Run Tray/Measuring/
+    # Calibrated walkthrough. See new_cal_ui().
+    cal_ui = new_cal_ui()
 
     while True:
         # Get current screen (with retries)
@@ -670,17 +827,55 @@ def monitor_touch_encoder_loop():
             cal_state = data.get("cal_state", None)
             requested = bool(data.get("calibrate_request", False))
 
-            cal_text = CAL_TEXT.get(cal_state, CAL_TEXT_UNKNOWN)
+            # The controller has left CAL_DONE, so it has seen our request and
+            # started over. That transition is the ack — drop the flag so the
+            # next press produces a fresh rising edge on the ClearCore, and only
+            # from here on does cal_state describe THIS calibration.
+            if requested and cal_state is not None and cal_state != CAL_STATE_DONE:
+                set_calibrate_request(False)
+                cal_request_raised_at = None
+                cal_ui["acked"] = True
+
+            # Give up on a session the controller never acknowledged, so the
+            # screen falls back to "Calibrate" and the operator can retry
+            # instead of staring at "Run Tray" forever.
+            if (cal_ui["started_at"] is not None and not cal_ui["acked"]
+                    and (time.monotonic() - cal_ui["started_at"]) >= CAL_REQUEST_TIMEOUT_SEC):
+                print("calibration request went unacknowledged; resetting the screen")
+                cal_ui = new_cal_ui()
+
+            # ---- choose the text ----
+            if cal_state is None:
+                cal_text = CAL_TEXT_UNKNOWN
+            elif cal_ui["started_at"] is None:
+                # Nothing asked for yet. Show the invitation, not the machine's
+                # standing state — arriving on an already-calibrated machine
+                # should still offer "Calibrate".
+                cal_text = CAL_TEXT_IDLE
+            elif not cal_ui["acked"]:
+                # We've asked but the controller hasn't reset yet. cal_state is
+                # still the PREVIOUS result, so honouring it here would flash
+                # "Calibrated" and bounce the operator off the screen instantly.
+                cal_text = CAL_TEXT[CAL_STATE_WAITING]
+            else:
+                cal_text = CAL_TEXT.get(cal_state, CAL_TEXT_UNKNOWN)
+
             if cal_text != last_cal_text:
                 set_string_var(CAL_SCREEN, CAL_STATUS_VAR, cal_text)
                 last_cal_text = cal_text
 
-            # The controller has left CAL_DONE, so it has seen our request and
-            # started over. That transition is the ack — drop the flag so the
-            # next press produces a fresh rising edge on the ClearCore.
-            if requested and cal_state is not None and cal_state != CAL_STATE_DONE:
-                set_calibrate_request(False)
-                cal_request_raised_at = None
+            # ---- finished: hold "Calibrated", then return to variety select ----
+            if cal_ui["acked"] and cal_state == CAL_STATE_DONE:
+                if cal_ui["done_at"] is None:
+                    cal_ui["done_at"] = time.monotonic()
+                elif (time.monotonic() - cal_ui["done_at"]) >= CAL_DONE_DWELL_SEC:
+                    print("calibration finished; returning to variety select")
+                    cal_ui = new_cal_ui()
+                    last_cal_text = None
+                    try:
+                        te.guide.set_screen(ScreenID(VARIETY_NAME_SCREEN))
+                    except Exception as e:
+                        print(f"Error returning to screen {VARIETY_NAME_SCREEN}: {e}")
 
             try:
                 pressed = (
@@ -691,11 +886,13 @@ def monitor_touch_encoder_loop():
                 pressed = 0
             if pressed:
                 # Repaint first so the button feels responsive, then raise the
-                # request. Showing the waiting text immediately also tells the
-                # operator what has to happen next: run a tray.
+                # request. Showing "Run Tray" immediately also tells the operator
+                # what has to happen next.
                 set_string_var(CAL_SCREEN, CAL_STATUS_VAR,
                                CAL_TEXT[CAL_STATE_WAITING])
                 last_cal_text = CAL_TEXT[CAL_STATE_WAITING]
+                cal_ui = new_cal_ui()
+                cal_ui["started_at"] = time.monotonic()
                 set_calibrate_request(True)
                 cal_request_raised_at = time.monotonic()
 
@@ -726,6 +923,12 @@ def main():
     global te
 
     ensure_json_exists(JSON_FILE_PATH)
+
+    # Before anything reads the settings: if the live file was damaged (power
+    # cut mid-write), restore it from the backup. Must run before the first
+    # ready_to_run_toggle below, because that write would otherwise bake an
+    # empty settings file over the damaged one.
+    recover_settings_if_needed(JSON_FILE_PATH)
 
     # Fail-safe: clear any stale ready_to_run persisted from a previous session
     # BEFORE discovery/restore. The TCP server is a separate process that streams
