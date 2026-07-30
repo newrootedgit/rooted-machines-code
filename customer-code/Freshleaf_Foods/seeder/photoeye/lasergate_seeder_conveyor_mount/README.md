@@ -219,11 +219,27 @@ sudo systemctl is-active seeder_poll.service seeder_tcp_server.service
 
 ## 8. SD card longevity (do this on every new Pi)
 
+**Short version: run `harden-pi.sh` and you are done.** It lives in the
+**Rooted-Web-App** repo at `pi-src/harden-pi.sh`, is safe on any Rooted Pi
+(seeder, harvester, or plain telemetry box), and is safe to run repeatedly —
+every step is idempotent and it only applies what is missing.
+
+```bash
+scp pi-src/harden-pi.sh rooted@<TAILSCALE_IP>:/tmp/
+ssh rooted@<TAILSCALE_IP> 'sudo bash /tmp/harden-pi.sh'
+```
+
+New Pis provisioned with `deploy-vector.sh` get the telemetry and journal caps
+automatically; the script is for machines already in the field, and as a
+belt-and-braces check on anything you are unsure about.
+
+The rest of this section explains *what* it does and why, so the reasoning
+survives even if the script does not.
+
 Flash **wear** is not the risk on these machines — the seeder scripts only write
 on operator actions, which works out to centuries of headroom on an industrial
 MLC card. The two things that actually kill a Pi in the field are **running out
-of disk** and **unclean power loss.** Both are addressed below, and both need
-doing once per machine.
+of disk** and **unclean power loss.**
 
 ### Cap the systemd journal
 
