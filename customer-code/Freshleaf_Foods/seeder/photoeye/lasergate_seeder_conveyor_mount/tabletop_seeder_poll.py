@@ -79,6 +79,22 @@ CAL_TEXT_UNKNOWN = "No link"
 # Calibrate again does nothing. Clearing it restores a working button.
 CAL_REQUEST_TIMEOUT_SEC = 15.0
 
+# Pressing Calibrate arms the machine on the operator's behalf. The sketch only
+# advances its calibration state machine while ready_to_run is true, so without
+# this the operator has to select a variety and press Activate first — and the
+# screen just sits on "Run a tray" while trays are ignored, which reads as a
+# hang. See the ready_to_run_flag gate in autocalibrate_photoeye.ino.
+#
+# We only auto-arm if the machine was paused, and we put it back to paused once
+# calibration completes. Nothing actuates while calibrating, so the machine is
+# inert for the whole auto-armed window; handing control back at CAL_DONE means
+# it never goes live off the back of a Calibrate press.
+#
+# Safety cap: if calibration never completes — no tray is ever run, the dwell
+# keeps getting rejected — disarm anyway rather than leaving a machine armed
+# because somebody pressed a button and walked away.
+CAL_AUTOARM_TIMEOUT_SEC = 180.0
+
 # Recovery strategy:
 #   "reconnect" (default) -> self-heal in-process by rediscovering the encoder
 #   "restart"             -> exit(42); let systemd restart the process (fresh venv/python)
@@ -354,6 +370,37 @@ def expire_calibrate_request(raised_at):
     set_calibrate_request(False)
     return None
 
+def resolve_calibration_autoarm(armed_at):
+    """
+    Release an auto-arm once calibration finishes, or after the safety cap.
+
+    `armed_at` is the monotonic time we armed the machine for calibration, or
+    None if we didn't. Returns the value to carry into the next cycle. Called
+    every cycle from any screen, because the operator will usually navigate away
+    to run the tray that completes the calibration.
+    """
+    if armed_at is None:
+        return None
+
+    data = locked_read_json(JSON_FILE_PATH) or {}
+
+    # Operator took explicit control while we were armed — their choice wins,
+    # so stop tracking rather than overriding them when calibration lands.
+    if not bool(data.get("ready_to_run", False)):
+        return None
+
+    if data.get("cal_state", None) == CAL_STATE_DONE:
+        print("calibration complete; releasing auto-arm")
+        ready_to_run_toggle(False)
+        return None
+
+    if (time.monotonic() - armed_at) >= CAL_AUTOARM_TIMEOUT_SEC:
+        print("calibration did not complete in time; releasing auto-arm")
+        ready_to_run_toggle(False)
+        return None
+
+    return armed_at
+
 def get_variety_name(variety_index: int) -> str:
     """Look up the display name for a variety index from JSON."""
     data = locked_read_json(JSON_FILE_PATH) or {}
@@ -451,6 +498,10 @@ def monitor_touch_encoder_loop():
     # When the outstanding calibration request was raised, for the ack timeout.
     cal_request_raised_at = None
 
+    # When we armed the machine on the operator's behalf for a calibration, so
+    # we know to hand it back to paused when the calibration lands.
+    cal_autoarm_at = None
+
     while True:
         # Get current screen (with retries)
         active_screen = safe_get_screen()
@@ -459,6 +510,10 @@ def monitor_touch_encoder_loop():
         # flag is relayed to the ClearCore continuously regardless of what the
         # operator is looking at, so it has to be able to expire from anywhere.
         cal_request_raised_at = expire_calibrate_request(cal_request_raised_at)
+
+        # Likewise from any screen: the operator has to walk away from screen 19
+        # to run the tray that completes the calibration.
+        cal_autoarm_at = resolve_calibration_autoarm(cal_autoarm_at)
 
         # On the selection screen, the encoder scrolls its own numeric variable
         # (screen 10 / var 1). Mirror that selection to the name string (var 7).
@@ -590,6 +645,10 @@ def monitor_touch_encoder_loop():
                 set_string_var(STATE_SCREEN, STATE_STATUS_VAR, new_status_text)
                 last_state_status = new_status_text
                 ready_to_run_toggle(new_running)
+                # The operator has taken explicit control of the run state, so
+                # drop any calibration auto-arm rather than overriding them when
+                # the calibration lands.
+                cal_autoarm_at = None
                 # Consume the press so the latch is re-armed. Without this the
                 # var stays 1 and the machine would toggle every poll cycle.
                 set_variable(STATE_SCREEN, STATE_BTN_PRESS_VAR, 0)
@@ -639,6 +698,17 @@ def monitor_touch_encoder_loop():
                 last_cal_text = CAL_TEXT[CAL_STATE_WAITING]
                 set_calibrate_request(True)
                 cal_request_raised_at = time.monotonic()
+
+                # Arm the machine if it is paused, so the sketch will actually
+                # advance its calibration state machine. Calibrating from a
+                # cold, unselected, paused machine has to work — that is the
+                # whole point of the button. resolve_calibration_autoarm() puts
+                # it back to paused once the calibration lands.
+                if not bool(data.get("ready_to_run", False)):
+                    print("auto-arming for calibration")
+                    ready_to_run_toggle(True)
+                    cal_autoarm_at = time.monotonic()
+
                 set_variable(CAL_SCREEN, CAL_TRIGGER_VAR, 0)
 
         else:
