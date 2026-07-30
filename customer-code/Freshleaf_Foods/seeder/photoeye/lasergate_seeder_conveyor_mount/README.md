@@ -67,6 +67,7 @@ Wants=network-online.target
 Type=simple
 User=rooted
 WorkingDirectory=/home/rooted/te-cli
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/home/rooted/te-cli/venv/bin/python /home/rooted/te-cli/tabletop_seeder_poll.py
 Restart=always
 RestartSec=2
@@ -88,6 +89,7 @@ Wants=network-online.target
 Type=simple
 User=rooted
 WorkingDirectory=/home/rooted/te-cli
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/home/rooted/te-cli/venv/bin/python /home/rooted/te-cli/tabletop_seeder_tcp_server.py
 Restart=always
 RestartSec=2
@@ -96,6 +98,13 @@ NoNewPrivileges=true
 WantedBy=multi-user.target
 EOF
 ```
+
+> **`PYTHONUNBUFFERED=1` is not optional.** Without it Python block-buffers
+> stdout when it isn't a tty, so `print()` output sits in a buffer instead of
+> reaching the journal. The TCP server then looks silent in `journalctl` even
+> while it is running perfectly — which has already cost real debugging time,
+> because "no log output" reads as "service is broken" and sends you chasing
+> the wrong thing entirely.
 
 ## 4. Enable and start
 
@@ -205,3 +214,64 @@ sudo systemctl is-active seeder_poll.service seeder_tcp_server.service
 
 > After changing any file under `/etc/systemd/system/`, run `sudo systemctl daemon-reload` before
 > `restart`. After changing a **`.py` script**, a plain `restart` is enough (no reload needed).
+
+---
+
+## 8. SD card longevity (do this on every new Pi)
+
+Flash **wear** is not the risk on these machines — the seeder scripts only write
+on operator actions, which works out to centuries of headroom on an industrial
+MLC card. The two things that actually kill a Pi in the field are **running out
+of disk** and **unclean power loss.** Both are addressed below, and both need
+doing once per machine.
+
+### Cap the systemd journal
+
+Journald defaults to using up to **10% of the filesystem** — about 1.6 GB on a
+16 GB card, growing silently until it gets there.
+
+```bash
+sudo mkdir -p /etc/systemd/journald.conf.d
+sudo tee /etc/systemd/journald.conf.d/size.conf >/dev/null <<'EOF'
+[Journal]
+SystemMaxUse=200M
+EOF
+sudo systemctl restart systemd-journald
+journalctl --disk-usage
+```
+
+At roughly 33 MB/month of logs, 200 MB keeps about six months of rolling
+history at a fixed, predictable cost.
+
+### Bound the telemetry log — only if this Pi runs the AWS pipeline
+
+If `rooted-ingest.service` is installed (it comes from the **Rooted-Web-App**
+repo, not this one), it appends one JSON record per ClearCore status frame to
+`/home/rooted/telemetry_log.jsonl` — **~38 MB/day, ~14 GB/year, and nothing
+truncates it.** On a 16 GB card that fills the disk in roughly eight months,
+after which writes fail and the machine misbehaves in confusing ways.
+
+Install the logrotate config from that repo
+(`pi-src/vector/rooted-telemetry.logrotate`), which bounds it to ~56 MB
+steady state. Verify with:
+
+```bash
+systemctl is-active rooted-ingest.service rooted-vector.service
+ls -lh /home/rooted/telemetry_log.jsonl*
+systemctl status logrotate.timer --no-pager     # must be active (waiting)
+```
+
+> **Check both services, not just one.** If `rooted-ingest` is running while
+> `rooted-vector` is not, the Pi writes telemetry all day that nothing ever
+> ships — and once rotation is installed, that data is silently deleted rather
+> than merely piling up. Either enable Vector, or disable the ingest service so
+> nothing is written in the first place.
+
+### Power loss
+
+The seeder scripts write `TE_Variable_Values.json` atomically (temp file →
+`fsync` → `os.replace` → directory `fsync`) and keep a `.bak` alongside it that
+is restored automatically at startup if the live file is unreadable. Nothing
+extra to configure — but **never** add code that rewrites that file with a
+plain `open(path, "w")`. That truncates before writing, and a power cut in the
+window destroys every variety preset on the machine.
