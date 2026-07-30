@@ -57,15 +57,19 @@ CAL_STATE_WAITING   = 0
 CAL_STATE_MEASURING = 1
 CAL_STATE_DONE      = 2
 
-# Calibration is NOT a bounded operation: the sketch only measures when the
-# machine is running AND a tray physically breaks the laser gate. So the waiting
-# text has to tell the operator to run a tray, or the screen looks hung.
+# Keep these SHORT — the screen 19 text field clips anything much longer than
+# ~11 characters. "Calibrating" is the longest string here and sets the budget.
+#
+# The waiting state says "Run a tray" rather than "Calibrate" because
+# calibration is NOT a bounded operation: the sketch only measures when the
+# machine is armed AND a tray physically breaks the laser gate. Without that
+# instruction the screen looks hung after the operator presses the button.
 CAL_TEXT = {
-    CAL_STATE_WAITING:   "Run a tray to calibrate",
-    CAL_STATE_MEASURING: "Measuring...",
-    CAL_STATE_DONE:      "Done calibrating",
+    CAL_STATE_WAITING:   "Run a tray",
+    CAL_STATE_MEASURING: "Calibrating",
+    CAL_STATE_DONE:      "Calibrated",
 }
-CAL_TEXT_UNKNOWN = "Waiting for controller"
+CAL_TEXT_UNKNOWN = "No link"
 
 # Give up on an unacknowledged calibration request after this long and drop the
 # flag. The ack is the controller reporting cal_state != DONE; if it never comes
