@@ -18,18 +18,116 @@ LOCK_FILE_PATH = JSON_FILE_PATH + ".lock"
 POLL_INTERVAL_SEC = 0.3  # matches original monitor loop cadence
 NUM_VARIETIES = 20       # total variety slots (1-20)
 
+# Valid min/max for each variety field, written into a freshly created settings
+# file. The live ranges are READ FROM THE SETTINGS FILE at runtime — see
+# load_variable_ranges() — so this is only the seed for a machine that has no
+# settings yet. Never validate against this constant directly, or a machine
+# whose ranges were tuned on site would be checked against the wrong bounds.
+#
+# Note the delay/duration fields legitimately go NEGATIVE: they are offsets, not
+# elapsed times. Any "nothing can be negative" rule would reject valid presets.
+DEFAULT_VARIABLE_RANGES = {
+    "roller_speed":        {"min": 0,    "max": 50},
+    "belt_speed":          {"min": 0,    "max": 10},
+    "irrigation_delay":    {"min": -100, "max": 100},
+    "irrigation_duration": {"min": -100, "max": 100},
+    "misting_delay":       {"min": -100, "max": 100},
+    "misting_duration":    {"min": -100, "max": 100},
+    "roller_delay":        {"min": -100, "max": 100},
+    "roller_duration":     {"min": -100, "max": 100},
+}
+
 # Variety name display on Touch Encoder
 VARIETY_NAME_SCREEN = 10   # Operator variety selection screen
 VARIETY_NAME_VAR = 7       # VariableID for the name string on screen 10
 
-# Machine state screen (status display + start/stop button)
-STATE_SCREEN = 19
-STATE_STATUS_VAR    = 1  # "Running" / "Stopped"
-STATE_PRESET_VAR    = 2  # selected preset name
-STATE_BTN_TEXT_VAR  = 3  # "Start Machine" / "Stop Machine" (dynamic button image)
-# Button 1 in GUIDE is configured with Action="Set value" -> writes 1 into
-# this Value ID. Poll detects nonzero, toggles ready_to_run, writes 0 back.
-STATE_BTN_PRESS_VAR = 4
+# Screen 18 is the run screen: it shows which variety is loaded AND carries the
+# Pause/Activate toggle, so RUNNING_VARIETY_SCREEN and STATE_SCREEN are the same
+# screen with different variables on it.
+#   var 1 -> variety name        var 2 -> "Active"/"Paused"    var 5 -> press latch
+RUNNING_VARIETY_SCREEN = 18
+RUNNING_VARIETY_VAR    = 1  # variety name string
+
+# Machine state (status display + pause/activate button), on screen 18.
+STATE_SCREEN = RUNNING_VARIETY_SCREEN
+STATE_STATUS_VAR    = 2  # "Active" / "Paused" — mirrors ready_to_run
+# The start/stop button in GUIDE is configured with Action="Set value" -> writes
+# 1 into this Value ID (default 0). Poll detects nonzero, toggles ready_to_run
+# in the JSON, then writes 0 back so the latch is re-armed for the next press.
+# Must be a NUMERIC value in GUIDE — safe_get_var calls .to_int() on the read.
+STATE_BTN_PRESS_VAR = 5
+
+# Status strings pushed to STATE_STATUS_VAR. These are display only; the machine
+# state itself lives in ready_to_run in the JSON, which the TCP server streams to
+# the ClearCore. Never derive the text from the encoder's own state.
+STATUS_TEXT_RUNNING = "Active"
+STATUS_TEXT_STOPPED = "Paused"
+
+# Calibration screen. The button writes 1 into CAL_TRIGGER_VAR the same way the
+# run screen's toggle does; poll relays it to the ClearCore as calibrate_request
+# in the JSON and renders the controller's reported cal_state back here.
+CAL_SCREEN      = 19
+CAL_TRIGGER_VAR = 4  # numeric latch, default 0, set to 1 on button press
+CAL_STATUS_VAR  = 3  # string var showing calibration progress
+
+# cal_state values as reported by the sketch, mirrored into the JSON by the TCP
+# server from its UDP listener.
+CAL_STATE_WAITING   = 0
+CAL_STATE_MEASURING = 1
+CAL_STATE_DONE      = 2
+
+# Keep these SHORT — the screen 19 text field clips anything much longer than
+# ~11 characters. "Calibrated" is the longest string here at 10.
+#
+# The screen walks the operator through the whole operation:
+#
+#   arrive          -> "Calibrate"   nothing has been asked for yet
+#   press button    -> "Run Tray"    armed and waiting for a tray
+#   tray in gate    -> "Measuring"   the controller registered the tray
+#   measured        -> "Calibrated"  then bounce back to the variety screen
+#
+# "Calibrate" vs "Run Tray" cannot be told apart from cal_state — both are
+# CAL_STATE_WAITING on an uncalibrated machine. The difference is whether THIS
+# operator has pressed the button, which only poll knows, so the screen is
+# driven by a local session (see cal_ui in the monitor loop) rather than by
+# cal_state alone.
+CAL_TEXT_IDLE      = "Calibrate"   # on arrival, before anything is requested
+CAL_TEXT_UNKNOWN   = "No link"     # controller not reporting
+
+# In-session text, keyed by the controller's reported cal_state.
+CAL_TEXT = {
+    CAL_STATE_WAITING:   "Run Tray",
+    CAL_STATE_MEASURING: "Measuring",
+    CAL_STATE_DONE:      "Calibrated",
+}
+
+# How long "Calibrated" stays up before the screen returns to variety select.
+# Long enough to read, short enough that nobody wonders if it's stuck.
+CAL_DONE_DWELL_SEC = 2.5
+
+# Give up on an unacknowledged calibration request after this long and drop the
+# flag. The ack is the controller reporting cal_state != DONE; if it never comes
+# (controller offline, link down, or running firmware that predates the
+# handshake) the request would otherwise stay latched high forever — and because
+# the sketch triggers on the RISING edge, a stuck-high flag means pressing
+# Calibrate again does nothing. Clearing it restores a working button.
+CAL_REQUEST_TIMEOUT_SEC = 15.0
+
+# Pressing Calibrate arms the machine on the operator's behalf. The sketch only
+# advances its calibration state machine while ready_to_run is true, so without
+# this the operator has to select a variety and press Activate first — and the
+# screen just sits on "Run a tray" while trays are ignored, which reads as a
+# hang. See the ready_to_run_flag gate in autocalibrate_photoeye.ino.
+#
+# We only auto-arm if the machine was paused, and we put it back to paused once
+# calibration completes. Nothing actuates while calibrating, so the machine is
+# inert for the whole auto-armed window; handing control back at CAL_DONE means
+# it never goes live off the back of a Calibrate press.
+#
+# Safety cap: if calibration never completes — no tray is ever run, the dwell
+# keeps getting rejected — disarm anyway rather than leaving a machine armed
+# because somebody pressed a button and walked away.
+CAL_AUTOARM_TIMEOUT_SEC = 180.0
 
 # Recovery strategy:
 #   "reconnect" (default) -> self-heal in-process by rediscovering the encoder
@@ -89,8 +187,145 @@ def ensure_json_exists(path: str):
                     json.dump({
                         "ready_to_run": False,
                         "active_variety": None,
+                        # Seeded here so a machine that regenerates its settings
+                        # still knows what a valid value looks like. Without it
+                        # the range checks below silently do nothing.
+                        "variable_ranges": DEFAULT_VARIABLE_RANGES,
                         "variety_names": default_names,
                     }, f, indent=4)
+
+def fsync_dir(dir_name: str):
+    """
+    Flush a directory entry so a rename is durable, not just the file contents.
+
+    os.replace() is atomic — a reader never sees a half-written file — but on
+    ext4 the rename itself only reaches the card when the journal commits,
+    which defaults to every 5 seconds. Without this, pulling power seconds
+    after saving a variety can silently roll that save back. The data is never
+    corrupted either way; this closes the window where it's merely lost.
+
+    Best effort: not every platform allows opening a directory (Windows does
+    not), and where it fails the file-level fsync above has still happened.
+    """
+    try:
+        fd = os.open(dir_name, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+def backup_settings(path: str):
+    """
+    Keep a known-good copy of the settings file alongside it.
+
+    Written after a successful variety save — the only time preset CONTENT
+    changes — so the copy always holds a complete, parseable set. Costs one
+    extra ~6 KB write per operator save, which is nothing next to the telemetry
+    stream, and it is the difference between "presets are gone" and "presets are
+    one cp away".
+
+    Atomic for the same reason the main file is: a torn backup is worse than no
+    backup, because it looks like a recovery option and isn't.
+    """
+    backup = path + ".bak"
+    dir_name = os.path.dirname(path)
+    try:
+        with open(path, "rb") as src:
+            blob = src.read()
+        # Refuse to overwrite a good backup with something unparseable.
+        json.loads(blob.decode("utf-8"))
+        fd, tmp_path = tempfile.mkstemp(prefix=".tmpbak_", dir=dir_name)
+        try:
+            with os.fdopen(fd, "wb") as tmpf:
+                tmpf.write(blob)
+                tmpf.flush()
+                os.fsync(tmpf.fileno())
+            os.replace(tmp_path, backup)
+            fsync_dir(dir_name)
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+    except (OSError, ValueError, UnicodeDecodeError) as e:
+        print(f"WARNING: could not back up {path}: {e}")
+
+def ensure_settings_backup(path: str):
+    """
+    Create the known-good copy at startup if one does not exist yet.
+
+    backup_settings() otherwise only runs after an operator saves a variety, so
+    a machine nobody has saved on has no .bak at all — and recover_settings_if_needed()
+    below then has nothing to restore from. The recovery path exists but is
+    disarmed, which is exactly the state the Freshleaf machine was found in after
+    an SD corruption: settings intact by luck, no backup, and no way to tell.
+
+    Only when the backup is MISSING. An existing .bak is the last state an
+    operator explicitly saved; refreshing it every boot from whatever happens to
+    be on disk would let a damaged-but-loadable file quietly replace a good copy.
+    """
+    backup = path + ".bak"
+    if os.path.exists(backup) or not os.path.exists(path):
+        return
+    print(f"no backup at {backup}; creating one from the current settings")
+    backup_settings(path)
+
+def recover_settings_if_needed(path: str):
+    """
+    Restore presets from the backup if the live file is unreadable.
+
+    Runs once at startup rather than from the read path: recovery needs an
+    exclusive lock and a well-defined moment, and the machine is not yet doing
+    anything. Without this an unattended machine silently comes up with zero
+    presets and nobody finds out until an operator goes looking for them.
+    """
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r") as f:
+            json.load(f)
+        return  # live file is fine
+    except (OSError, json.JSONDecodeError):
+        pass
+
+    backup = path + ".bak"
+    try:
+        with open(backup, "r") as f:
+            restored = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        print(f"WARNING: {path} is unreadable and no usable backup exists at "
+              f"{backup}. Variety presets will need to be re-entered.")
+        quarantine_corrupt_json(path)
+        return
+
+    quarantine_corrupt_json(path)
+    locked_atomic_write_json(path, restored)
+    varieties = len([k for k in restored if str(k).isdigit()])
+    print(f"RECOVERED {path} from {backup} ({varieties} variety presets restored)")
+
+def quarantine_corrupt_json(path: str):
+    """
+    Preserve a copy of an unparseable settings file, once.
+
+    Copies rather than moves: the machine has to keep running, and the callers
+    all treat a missing file as "start fresh". Only the FIRST corruption is kept
+    — a later good save followed by another corruption would otherwise overwrite
+    the copy that still had the operator's presets in it.
+    """
+    backup = path + ".corrupt"
+    try:
+        if os.path.exists(backup):
+            print(f"WARNING: {path} is unreadable; existing copy at {backup}")
+            return
+        with open(path, "rb") as src, open(backup, "wb") as dst:
+            dst.write(src.read())
+        print(f"WARNING: {path} is unreadable — variety presets may be lost. "
+              f"A copy was kept at {backup} for recovery.")
+    except OSError as e:
+        print(f"WARNING: {path} is unreadable and could not be copied: {e}")
 
 def locked_read_json(path: str) -> Dict:
     with FileLock(LOCK_FILE_PATH, shared=True):
@@ -100,6 +335,11 @@ def locked_read_json(path: str) -> Dict:
         except FileNotFoundError:
             return {}
         except json.JSONDecodeError:
+            # A damaged file reads as "no presets", and the next save would then
+            # write a fresh file containing only that one variety — turning
+            # recoverable damage into permanent loss. Keep a copy before anyone
+            # overwrites it, and say so loudly rather than failing silently.
+            quarantine_corrupt_json(path)
             return {}
 
 def locked_atomic_write_json(path: str, data: Dict):
@@ -113,6 +353,7 @@ def locked_atomic_write_json(path: str, data: Dict):
                 tmpf.flush()
                 os.fsync(tmpf.fileno())
             os.replace(tmp_path, path)
+            fsync_dir(dir_name)
         finally:
             if os.path.exists(tmp_path):
                 try:
@@ -221,10 +462,73 @@ def load_variety_data() -> Dict:
     data = locked_read_json(JSON_FILE_PATH) or {}
     return data
 
+def load_variable_ranges(data: Dict) -> Dict:
+    """
+    Return the min/max declared for each variety field by the settings file.
+
+    Read from the file rather than from DEFAULT_VARIABLE_RANGES so a machine
+    whose limits were tuned on site is checked against ITS limits. Returns {}
+    when the file predates the ranges block, which disables the checks below —
+    the right failure direction, since inventing bounds risks rejecting presets
+    an operator legitimately saved.
+    """
+    ranges = data.get("variable_ranges")
+    return ranges if isinstance(ranges, dict) else {}
+
+def preset_issues(values: Dict, ranges: Dict) -> list:
+    """
+    Return human-readable problems with one variety's stored values.
+
+    Only fields the settings file declares a range for are checked, and only
+    against that declared range. Note that most of these fields are offsets and
+    legitimately go negative (-100..100), so the sign of a value says nothing on
+    its own.
+    """
+    issues = []
+    for field, bounds in ranges.items():
+        if field not in values or not isinstance(bounds, dict):
+            continue
+        v = values[field]
+        # bool is an int subclass; a True in a numeric slot is damage, not a value.
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            issues.append(f"{field}={v!r} is not a number")
+            continue
+        lo, hi = bounds.get("min"), bounds.get("max")
+        if isinstance(lo, (int, float)) and v < lo:
+            issues.append(f"{field}={v} below min {lo}")
+        elif isinstance(hi, (int, float)) and v > hi:
+            issues.append(f"{field}={v} above max {hi}")
+    return issues
+
+def audit_stored_presets(path: str):
+    """
+    Log any stored variety values that fall outside their declared range.
+
+    Damaged storage does not always produce unparseable JSON — a corrupted block
+    can land inside a number and leave a file that loads cleanly and carries a
+    value nothing else would question. This only reports; it never edits. The
+    operator re-saves the variety, which is the one action that can produce a
+    correct value.
+    """
+    data = locked_read_json(path) or {}
+    ranges = load_variable_ranges(data)
+    if not ranges:
+        print("audit_stored_presets: settings declare no variable_ranges; "
+              "skipping the range check")
+        return
+
+    for key in sorted((k for k in data if str(k).isdigit()), key=int):
+        v = data.get(key)
+        if not isinstance(v, dict):
+            continue
+        issues = preset_issues(v, ranges)
+        if issues:
+            print(f"WARNING: variety {key} has out-of-range stored values — "
+                  f"{'; '.join(issues)}. Re-enter and save this variety.")
+
 def save_variety_data(
     variety_index: int,
     roller_speed: int,
-    belt_speed: int,
     irrigation_delay: int,
     irrigation_duration: int,
     misting_delay: int,
@@ -234,9 +538,15 @@ def save_variety_data(
 ):
     data = locked_read_json(JSON_FILE_PATH) or {}
     key = str(int(variety_index))
-    data[key] = {
+    # belt_speed no longer has a Touch Encoder screen — the conveyor runs off the
+    # VFD dial and the sketch autocalibrates. The web app still reads this key,
+    # so carry whatever is already on disk through untouched instead of dropping
+    # it. Poll neither sources nor overwrites the value.
+    existing = data.get(key)
+    prior_belt_speed = existing.get("belt_speed", 0) if isinstance(existing, dict) else 0
+    entry = {
         "roller_speed": int(roller_speed),
-        "belt_speed": int(belt_speed),
+        "belt_speed": prior_belt_speed,
         "irrigation_delay": int(irrigation_delay),
         "irrigation_duration": int(irrigation_duration),
         "misting_delay": int(misting_delay),
@@ -244,8 +554,24 @@ def save_variety_data(
         "roller_delay": int(roller_delay),
         "roller_duration": int(roller_duration),
     }
+
+    # A garbled encoder read must not become a stored preset. Checked against
+    # the ranges the settings file itself declares, so this can only reject a
+    # value the machine already considers invalid — it cannot second-guess a
+    # legitimate save. The previous values stay on disk, which is the safer
+    # outcome: keeping the last known-good preset beats overwriting it with
+    # something the machine says is impossible.
+    issues = preset_issues(entry, load_variable_ranges(data))
+    if issues:
+        print(f"REFUSING to save variety {key} — {'; '.join(issues)}. "
+              f"Previous values left in place.")
+        return
+
+    data[key] = entry
     locked_atomic_write_json(JSON_FILE_PATH, data)
     print(f"Saved variety {key} to JSON")
+    # Preset content just changed — refresh the known-good copy.
+    backup_settings(JSON_FILE_PATH)
 
 def save_active_variety(variety_index: int):
     data = locked_read_json(JSON_FILE_PATH) or {}
@@ -262,6 +588,92 @@ def ready_to_run_toggle(flag: bool):
     data["ready_to_run"] = bool(flag)
     locked_atomic_write_json(JSON_FILE_PATH, data)
     print(f"ready_to_run set to {bool(flag)}")
+
+def set_calibrate_request(flag: bool):
+    """
+    Raise or clear the calibration request for the ClearCore.
+
+    The TCP server relays this as a CSV field and the sketch edge-triggers on
+    the 0->1 transition. We hold it high until the controller confirms it acted
+    (cal_state leaves "done"), then clear it — that round trip IS the ack.
+    """
+    data = locked_read_json(JSON_FILE_PATH) or {}
+    if bool(data.get("calibrate_request", False)) == bool(flag):
+        return
+    data["calibrate_request"] = bool(flag)
+    locked_atomic_write_json(JSON_FILE_PATH, data)
+    print(f"calibrate_request set to {bool(flag)}")
+
+def expire_calibrate_request(raised_at):
+    """
+    Drop a calibration request the controller never acknowledged.
+
+    Returns the timestamp to carry into the next cycle, or None if no request is
+    outstanding. A `raised_at` of None while the flag is set on disk means we
+    inherited it — poll restarted, or the flag predates this session — so we
+    adopt it and start the clock rather than letting it sit latched forever.
+    """
+    data = locked_read_json(JSON_FILE_PATH) or {}
+    if not bool(data.get("calibrate_request", False)):
+        return None
+
+    now = time.monotonic()
+    if raised_at is None:
+        return now
+    if (now - raised_at) < CAL_REQUEST_TIMEOUT_SEC:
+        return raised_at
+
+    print("calibrate_request: no controller ack, clearing so the button works again")
+    set_calibrate_request(False)
+    return None
+
+def new_cal_ui() -> Dict:
+    """
+    Fresh calibration-screen session state.
+
+      started_at  when the operator pressed Calibrate, or None if idle
+      acked       True once the controller confirmed it started over, after
+                  which cal_state describes THIS calibration rather than the
+                  previous one
+      done_at     when "Calibrated" first went up, for the dwell before we
+                  return the operator to the variety screen
+
+    Deliberately survives navigating away from screen 19 — the operator usually
+    has to walk to the machine to run the tray, and should come back to live
+    progress rather than a reset screen.
+    """
+    return {"started_at": None, "acked": False, "done_at": None}
+
+def resolve_calibration_autoarm(armed_at):
+    """
+    Release an auto-arm once calibration finishes, or after the safety cap.
+
+    `armed_at` is the monotonic time we armed the machine for calibration, or
+    None if we didn't. Returns the value to carry into the next cycle. Called
+    every cycle from any screen, because the operator will usually navigate away
+    to run the tray that completes the calibration.
+    """
+    if armed_at is None:
+        return None
+
+    data = locked_read_json(JSON_FILE_PATH) or {}
+
+    # Operator took explicit control while we were armed — their choice wins,
+    # so stop tracking rather than overriding them when calibration lands.
+    if not bool(data.get("ready_to_run", False)):
+        return None
+
+    if data.get("cal_state", None) == CAL_STATE_DONE:
+        print("calibration complete; releasing auto-arm")
+        ready_to_run_toggle(False)
+        return None
+
+    if (time.monotonic() - armed_at) >= CAL_AUTOARM_TIMEOUT_SEC:
+        print("calibration did not complete in time; releasing auto-arm")
+        ready_to_run_toggle(False)
+        return None
+
+    return armed_at
 
 def get_variety_name(variety_index: int) -> str:
     """Look up the display name for a variety index from JSON."""
@@ -303,8 +715,14 @@ def restore_vars_if_reset():
     print(f"restore_vars_if_reset: restoring values for variety {key}")
     set_variable(VARIETY_NAME_SCREEN, 1, active_variety)  # restore selection index
     write_variety_to_screen(active_variety)               # restore name on screen 10
+    # Repaint the running screen too. Without this it keeps whatever name was
+    # there before the restart, which would claim the machine is running a
+    # variety it isn't.
+    write_variety_to_screen(
+        active_variety, RUNNING_VARIETY_SCREEN, RUNNING_VARIETY_VAR
+    )
     set_variable(6, 1, v.get("roller_speed", 0))        # Roller Speed
-    set_variable(3, 1, v.get("belt_speed", 0))          # Belt Speed
+    # Screen 3 (Belt Speed) was removed from the TE menu — nothing to restore.
     set_variable(11, 1, v.get("irrigation_delay", 0))   # Irrigation Delay
     set_variable(12, 1, v.get("irrigation_duration", 0))# Irrigation Duration
     set_variable(13, 1, v.get("misting_delay", 0))      # Misting Delay
@@ -344,14 +762,36 @@ def monitor_touch_encoder_loop():
     # Track the last index we wrote a name for, so we only push on change
     last_shown_index = None
 
-    # Screen 19 display caches — only push to encoder when value changes
+    # Per-screen display caches — only push to encoder when the text changes,
+    # and each doubles as the "just entered that screen" signal (None == not on
+    # it last tick). Each screen's branch clears the OTHER cache, so navigating
+    # 18 <-> 19 directly still re-runs the stale-press guard on arrival.
     last_state_status = None
-    last_state_preset = None
-    last_state_btn_text = None
+    last_cal_text = None
+
+    # When the outstanding calibration request was raised, for the ack timeout.
+    cal_request_raised_at = None
+
+    # When we armed the machine on the operator's behalf for a calibration, so
+    # we know to hand it back to paused when the calibration lands.
+    cal_autoarm_at = None
+
+    # Calibration screen session — drives the Calibrate/Run Tray/Measuring/
+    # Calibrated walkthrough. See new_cal_ui().
+    cal_ui = new_cal_ui()
 
     while True:
         # Get current screen (with retries)
         active_screen = safe_get_screen()
+
+        # Checked every cycle, not just on the calibration screen: the request
+        # flag is relayed to the ClearCore continuously regardless of what the
+        # operator is looking at, so it has to be able to expire from anywhere.
+        cal_request_raised_at = expire_calibrate_request(cal_request_raised_at)
+
+        # Likewise from any screen: the operator has to walk away from screen 19
+        # to run the tray that completes the calibration.
+        cal_autoarm_at = resolve_calibration_autoarm(cal_autoarm_at)
 
         # On the selection screen, the encoder scrolls its own numeric variable
         # (screen 10 / var 1). Mirror that selection to the name string (var 7).
@@ -369,7 +809,6 @@ def monitor_touch_encoder_loop():
         if active_screen == ScreenID(9):
             variety_index = get_variable(10, 1)     # current variety selection
             roller_speed = get_variable(6, 1)       # roller speed
-            belt_speed = get_variable(3, 1)         # belt speed
             irrigation_delay = get_variable(11, 1)  # irrigation delay
             irrigation_duration = get_variable(12, 1)
             misting_delay = get_variable(13, 1)
@@ -380,7 +819,6 @@ def monitor_touch_encoder_loop():
             if None not in (
                 variety_index,
                 roller_speed,
-                belt_speed,
                 irrigation_delay,
                 irrigation_duration,
                 misting_delay,
@@ -392,7 +830,6 @@ def monitor_touch_encoder_loop():
                 save_variety_data(
                     variety_index,
                     roller_speed,
-                    belt_speed,
                     irrigation_delay,
                     irrigation_duration,
                     misting_delay,
@@ -410,15 +847,17 @@ def monitor_touch_encoder_loop():
         elif active_screen == ScreenID(17):
             variety_index = get_variable(10, 1)
 
-            # Show the user feedback FIRST: push the name onto screen 18 and
-            # navigate there immediately. The value loads below take ~8 set_var
-            # round-trips, so doing the visual confirmation up front makes the
-            # selection feel instant.
-            write_variety_to_screen(variety_index, 18, 2)
+            # Show the user feedback FIRST: push the name onto the running screen
+            # and navigate there immediately. The value loads below take ~8
+            # set_var round-trips, so doing the visual confirmation up front
+            # makes the selection feel instant.
+            write_variety_to_screen(
+                variety_index, RUNNING_VARIETY_SCREEN, RUNNING_VARIETY_VAR
+            )
             try:
-                te.guide.set_screen(ScreenID(18))
+                te.guide.set_screen(ScreenID(RUNNING_VARIETY_SCREEN))
             except Exception as e:
-                print(f"Error setting screen 18: {e}")
+                print(f"Error setting screen {RUNNING_VARIETY_SCREEN}: {e}")
 
             save_active_variety(variety_index)  # Save active variety to JSON
             saved_data = load_variety_data()
@@ -430,7 +869,7 @@ def monitor_touch_encoder_loop():
                 # Push saved values into the encoder (done after navigation
                 # so the user already sees the new screen).
                 set_variable(6, 1, saved_values.get("roller_speed", 0))        # Roller Speed
-                set_variable(3, 1, saved_values.get("belt_speed", 0))          # Belt Speed
+                # Screen 3 (Belt Speed) was removed from the TE menu — not pushed.
                 set_variable(11, 1, saved_values.get("irrigation_delay", 0))   # Irrigation Delay
                 set_variable(12, 1, saved_values.get("irrigation_duration", 0))# Irrigation Duration
                 set_variable(13, 1, saved_values.get("misting_delay", 0))      # Misting Delay
@@ -444,37 +883,31 @@ def monitor_touch_encoder_loop():
                 print(f"Variety {variety_index} not found. Waiting for user to define it.")
 
         # ---------------------------------------------
-        # Screen 19: Machine state (status + start/stop button)
+        # Screen 18: Run screen (variety name + Active/Paused + toggle button)
         # ---------------------------------------------
         elif active_screen == ScreenID(STATE_SCREEN):
+            last_cal_text = None  # arriving here means we left the cal screen
+
             # On first arrival, zero the press var so the stale "Set value"
             # default from GUIDE isn't misread as a real tap. last_state_status
-            # being None is our "just entered screen 19" signal.
+            # being None is our "just entered the run screen" signal.
             first_entry = last_state_status is None
             if first_entry:
                 set_variable(STATE_SCREEN, STATE_BTN_PRESS_VAR, 0)
 
+            # ready_to_run in the JSON is the single source of truth — not the
+            # encoder. Deriving the text from it (rather than flipping whatever
+            # is currently displayed) is what makes the screen repaint correctly
+            # after a poll restart, a TE reconnect, or a change made elsewhere.
             data = locked_read_json(JSON_FILE_PATH) or {}
             running = bool(data.get("ready_to_run", False))
-            active_variety = data.get("active_variety", None)
 
-            status_text = "Running" if running else "Stopped"
-            btn_text = "Stop Machine" if running else "Start Machine"
-            preset_text = (
-                get_variety_name(active_variety) if active_variety is not None else ""
-            )
-
+            status_text = STATUS_TEXT_RUNNING if running else STATUS_TEXT_STOPPED
             if status_text != last_state_status:
                 set_string_var(STATE_SCREEN, STATE_STATUS_VAR, status_text)
                 last_state_status = status_text
-            if preset_text != last_state_preset:
-                set_string_var(STATE_SCREEN, STATE_PRESET_VAR, preset_text)
-                last_state_preset = preset_text
-            if btn_text != last_state_btn_text:
-                set_string_var(STATE_SCREEN, STATE_BTN_TEXT_VAR, btn_text)
-                last_state_btn_text = btn_text
 
-            # Button 1 ("Set value" action in GUIDE) writes 1 into the press
+            # The button ("Set value" action in GUIDE) writes 1 into the press
             # var on tap. Treat any nonzero as a press: repaint the encoder
             # first so the UI feels immediate, THEN flip ready_to_run.
             # Skip on first_entry — we just zeroed the var ourselves.
@@ -484,20 +917,123 @@ def monitor_touch_encoder_loop():
                 pressed = 0
             if pressed:
                 new_running = not running
-                new_status_text = "Running" if new_running else "Stopped"
-                new_btn_text = "Stop Machine" if new_running else "Start Machine"
+                new_status_text = (
+                    STATUS_TEXT_RUNNING if new_running else STATUS_TEXT_STOPPED
+                )
                 set_string_var(STATE_SCREEN, STATE_STATUS_VAR, new_status_text)
-                set_string_var(STATE_SCREEN, STATE_BTN_TEXT_VAR, new_btn_text)
                 last_state_status = new_status_text
-                last_state_btn_text = new_btn_text
                 ready_to_run_toggle(new_running)
+                # The operator has taken explicit control of the run state, so
+                # drop any calibration auto-arm rather than overriding them when
+                # the calibration lands.
+                cal_autoarm_at = None
+                # Consume the press so the latch is re-armed. Without this the
+                # var stays 1 and the machine would toggle every poll cycle.
                 set_variable(STATE_SCREEN, STATE_BTN_PRESS_VAR, 0)
 
+        # ---------------------------------------------
+        # Screen 19: Calibration (status text + calibrate button)
+        # ---------------------------------------------
+        elif active_screen == ScreenID(CAL_SCREEN):
+            last_state_status = None  # arriving here means we left the run screen
+
+            # Same stale-press guard as the run screen: zero the latch on
+            # arrival and skip one read, so a press left unconsumed from a
+            # previous visit can't fire the moment we navigate back.
+            cal_first_entry = last_cal_text is None
+            if cal_first_entry:
+                set_variable(CAL_SCREEN, CAL_TRIGGER_VAR, 0)
+
+            data = locked_read_json(JSON_FILE_PATH) or {}
+            cal_state = data.get("cal_state", None)
+            requested = bool(data.get("calibrate_request", False))
+
+            # The controller has left CAL_DONE, so it has seen our request and
+            # started over. That transition is the ack — drop the flag so the
+            # next press produces a fresh rising edge on the ClearCore, and only
+            # from here on does cal_state describe THIS calibration.
+            if requested and cal_state is not None and cal_state != CAL_STATE_DONE:
+                set_calibrate_request(False)
+                cal_request_raised_at = None
+                cal_ui["acked"] = True
+
+            # Give up on a session the controller never acknowledged, so the
+            # screen falls back to "Calibrate" and the operator can retry
+            # instead of staring at "Run Tray" forever.
+            if (cal_ui["started_at"] is not None and not cal_ui["acked"]
+                    and (time.monotonic() - cal_ui["started_at"]) >= CAL_REQUEST_TIMEOUT_SEC):
+                print("calibration request went unacknowledged; resetting the screen")
+                cal_ui = new_cal_ui()
+
+            # ---- choose the text ----
+            if cal_state is None:
+                cal_text = CAL_TEXT_UNKNOWN
+            elif cal_ui["started_at"] is None:
+                # Nothing asked for yet. Show the invitation, not the machine's
+                # standing state — arriving on an already-calibrated machine
+                # should still offer "Calibrate".
+                cal_text = CAL_TEXT_IDLE
+            elif not cal_ui["acked"]:
+                # We've asked but the controller hasn't reset yet. cal_state is
+                # still the PREVIOUS result, so honouring it here would flash
+                # "Calibrated" and bounce the operator off the screen instantly.
+                cal_text = CAL_TEXT[CAL_STATE_WAITING]
+            else:
+                cal_text = CAL_TEXT.get(cal_state, CAL_TEXT_UNKNOWN)
+
+            if cal_text != last_cal_text:
+                set_string_var(CAL_SCREEN, CAL_STATUS_VAR, cal_text)
+                last_cal_text = cal_text
+
+            # ---- finished: hold "Calibrated", then return to variety select ----
+            if cal_ui["acked"] and cal_state == CAL_STATE_DONE:
+                if cal_ui["done_at"] is None:
+                    cal_ui["done_at"] = time.monotonic()
+                elif (time.monotonic() - cal_ui["done_at"]) >= CAL_DONE_DWELL_SEC:
+                    print("calibration finished; returning to variety select")
+                    cal_ui = new_cal_ui()
+                    last_cal_text = None
+                    try:
+                        te.guide.set_screen(ScreenID(VARIETY_NAME_SCREEN))
+                    except Exception as e:
+                        print(f"Error returning to screen {VARIETY_NAME_SCREEN}: {e}")
+
+            try:
+                pressed = (
+                    0 if cal_first_entry
+                    else safe_get_var(CAL_SCREEN, CAL_TRIGGER_VAR)
+                )
+            except Exception:
+                pressed = 0
+            if pressed:
+                # Repaint first so the button feels responsive, then raise the
+                # request. Showing "Run Tray" immediately also tells the operator
+                # what has to happen next.
+                set_string_var(CAL_SCREEN, CAL_STATUS_VAR,
+                               CAL_TEXT[CAL_STATE_WAITING])
+                last_cal_text = CAL_TEXT[CAL_STATE_WAITING]
+                cal_ui = new_cal_ui()
+                cal_ui["started_at"] = time.monotonic()
+                set_calibrate_request(True)
+                cal_request_raised_at = time.monotonic()
+
+                # Arm the machine if it is paused, so the sketch will actually
+                # advance its calibration state machine. Calibrating from a
+                # cold, unselected, paused machine has to work — that is the
+                # whole point of the button. resolve_calibration_autoarm() puts
+                # it back to paused once the calibration lands.
+                if not bool(data.get("ready_to_run", False)):
+                    print("auto-arming for calibration")
+                    ready_to_run_toggle(True)
+                    cal_autoarm_at = time.monotonic()
+
+                set_variable(CAL_SCREEN, CAL_TRIGGER_VAR, 0)
+
         else:
-            # Leaving the state screen — invalidate caches so re-entry repaints.
+            # Leaving the state screen — invalidate the caches so re-entry
+            # repaints, and so the next arrival re-runs the first_entry guard.
             last_state_status = None
-            last_state_preset = None
-            last_state_btn_text = None
+            last_cal_text = None
 
         time.sleep(POLL_INTERVAL_SEC)
 
@@ -508,6 +1044,18 @@ def main():
     global te
 
     ensure_json_exists(JSON_FILE_PATH)
+
+    # Before anything reads the settings: if the live file was damaged (power
+    # cut mid-write), restore it from the backup. Must run before the first
+    # ready_to_run_toggle below, because that write would otherwise bake an
+    # empty settings file over the damaged one.
+    recover_settings_if_needed(JSON_FILE_PATH)
+
+    # Arm the recovery path above for next time, then report anything that
+    # loaded cleanly but cannot be a real value. Both run before discovery so
+    # they land in the journal ahead of any device chatter.
+    ensure_settings_backup(JSON_FILE_PATH)
+    audit_stored_presets(JSON_FILE_PATH)
 
     # Fail-safe: clear any stale ready_to_run persisted from a previous session
     # BEFORE discovery/restore. The TCP server is a separate process that streams
