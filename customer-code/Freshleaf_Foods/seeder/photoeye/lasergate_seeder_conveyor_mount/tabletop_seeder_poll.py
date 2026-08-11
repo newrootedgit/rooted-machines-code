@@ -18,6 +18,25 @@ LOCK_FILE_PATH = JSON_FILE_PATH + ".lock"
 POLL_INTERVAL_SEC = 0.3  # matches original monitor loop cadence
 NUM_VARIETIES = 20       # total variety slots (1-20)
 
+# Valid min/max for each variety field, written into a freshly created settings
+# file. The live ranges are READ FROM THE SETTINGS FILE at runtime — see
+# load_variable_ranges() — so this is only the seed for a machine that has no
+# settings yet. Never validate against this constant directly, or a machine
+# whose ranges were tuned on site would be checked against the wrong bounds.
+#
+# Note the delay/duration fields legitimately go NEGATIVE: they are offsets, not
+# elapsed times. Any "nothing can be negative" rule would reject valid presets.
+DEFAULT_VARIABLE_RANGES = {
+    "roller_speed":        {"min": 0,    "max": 50},
+    "belt_speed":          {"min": 0,    "max": 10},
+    "irrigation_delay":    {"min": -100, "max": 100},
+    "irrigation_duration": {"min": -100, "max": 100},
+    "misting_delay":       {"min": -100, "max": 100},
+    "misting_duration":    {"min": -100, "max": 100},
+    "roller_delay":        {"min": -100, "max": 100},
+    "roller_duration":     {"min": -100, "max": 100},
+}
+
 # Variety name display on Touch Encoder
 VARIETY_NAME_SCREEN = 10   # Operator variety selection screen
 VARIETY_NAME_VAR = 7       # VariableID for the name string on screen 10
@@ -168,6 +187,10 @@ def ensure_json_exists(path: str):
                     json.dump({
                         "ready_to_run": False,
                         "active_variety": None,
+                        # Seeded here so a machine that regenerates its settings
+                        # still knows what a valid value looks like. Without it
+                        # the range checks below silently do nothing.
+                        "variable_ranges": DEFAULT_VARIABLE_RANGES,
                         "variety_names": default_names,
                     }, f, indent=4)
 
@@ -229,6 +252,26 @@ def backup_settings(path: str):
                     pass
     except (OSError, ValueError, UnicodeDecodeError) as e:
         print(f"WARNING: could not back up {path}: {e}")
+
+def ensure_settings_backup(path: str):
+    """
+    Create the known-good copy at startup if one does not exist yet.
+
+    backup_settings() otherwise only runs after an operator saves a variety, so
+    a machine nobody has saved on has no .bak at all — and recover_settings_if_needed()
+    below then has nothing to restore from. The recovery path exists but is
+    disarmed, which is exactly the state the Freshleaf machine was found in after
+    an SD corruption: settings intact by luck, no backup, and no way to tell.
+
+    Only when the backup is MISSING. An existing .bak is the last state an
+    operator explicitly saved; refreshing it every boot from whatever happens to
+    be on disk would let a damaged-but-loadable file quietly replace a good copy.
+    """
+    backup = path + ".bak"
+    if os.path.exists(backup) or not os.path.exists(path):
+        return
+    print(f"no backup at {backup}; creating one from the current settings")
+    backup_settings(path)
 
 def recover_settings_if_needed(path: str):
     """
@@ -419,6 +462,70 @@ def load_variety_data() -> Dict:
     data = locked_read_json(JSON_FILE_PATH) or {}
     return data
 
+def load_variable_ranges(data: Dict) -> Dict:
+    """
+    Return the min/max declared for each variety field by the settings file.
+
+    Read from the file rather than from DEFAULT_VARIABLE_RANGES so a machine
+    whose limits were tuned on site is checked against ITS limits. Returns {}
+    when the file predates the ranges block, which disables the checks below —
+    the right failure direction, since inventing bounds risks rejecting presets
+    an operator legitimately saved.
+    """
+    ranges = data.get("variable_ranges")
+    return ranges if isinstance(ranges, dict) else {}
+
+def preset_issues(values: Dict, ranges: Dict) -> list:
+    """
+    Return human-readable problems with one variety's stored values.
+
+    Only fields the settings file declares a range for are checked, and only
+    against that declared range. Note that most of these fields are offsets and
+    legitimately go negative (-100..100), so the sign of a value says nothing on
+    its own.
+    """
+    issues = []
+    for field, bounds in ranges.items():
+        if field not in values or not isinstance(bounds, dict):
+            continue
+        v = values[field]
+        # bool is an int subclass; a True in a numeric slot is damage, not a value.
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            issues.append(f"{field}={v!r} is not a number")
+            continue
+        lo, hi = bounds.get("min"), bounds.get("max")
+        if isinstance(lo, (int, float)) and v < lo:
+            issues.append(f"{field}={v} below min {lo}")
+        elif isinstance(hi, (int, float)) and v > hi:
+            issues.append(f"{field}={v} above max {hi}")
+    return issues
+
+def audit_stored_presets(path: str):
+    """
+    Log any stored variety values that fall outside their declared range.
+
+    Damaged storage does not always produce unparseable JSON — a corrupted block
+    can land inside a number and leave a file that loads cleanly and carries a
+    value nothing else would question. This only reports; it never edits. The
+    operator re-saves the variety, which is the one action that can produce a
+    correct value.
+    """
+    data = locked_read_json(path) or {}
+    ranges = load_variable_ranges(data)
+    if not ranges:
+        print("audit_stored_presets: settings declare no variable_ranges; "
+              "skipping the range check")
+        return
+
+    for key in sorted((k for k in data if str(k).isdigit()), key=int):
+        v = data.get(key)
+        if not isinstance(v, dict):
+            continue
+        issues = preset_issues(v, ranges)
+        if issues:
+            print(f"WARNING: variety {key} has out-of-range stored values — "
+                  f"{'; '.join(issues)}. Re-enter and save this variety.")
+
 def save_variety_data(
     variety_index: int,
     roller_speed: int,
@@ -437,7 +544,7 @@ def save_variety_data(
     # it. Poll neither sources nor overwrites the value.
     existing = data.get(key)
     prior_belt_speed = existing.get("belt_speed", 0) if isinstance(existing, dict) else 0
-    data[key] = {
+    entry = {
         "roller_speed": int(roller_speed),
         "belt_speed": prior_belt_speed,
         "irrigation_delay": int(irrigation_delay),
@@ -447,6 +554,20 @@ def save_variety_data(
         "roller_delay": int(roller_delay),
         "roller_duration": int(roller_duration),
     }
+
+    # A garbled encoder read must not become a stored preset. Checked against
+    # the ranges the settings file itself declares, so this can only reject a
+    # value the machine already considers invalid — it cannot second-guess a
+    # legitimate save. The previous values stay on disk, which is the safer
+    # outcome: keeping the last known-good preset beats overwriting it with
+    # something the machine says is impossible.
+    issues = preset_issues(entry, load_variable_ranges(data))
+    if issues:
+        print(f"REFUSING to save variety {key} — {'; '.join(issues)}. "
+              f"Previous values left in place.")
+        return
+
+    data[key] = entry
     locked_atomic_write_json(JSON_FILE_PATH, data)
     print(f"Saved variety {key} to JSON")
     # Preset content just changed — refresh the known-good copy.
@@ -929,6 +1050,12 @@ def main():
     # ready_to_run_toggle below, because that write would otherwise bake an
     # empty settings file over the damaged one.
     recover_settings_if_needed(JSON_FILE_PATH)
+
+    # Arm the recovery path above for next time, then report anything that
+    # loaded cleanly but cannot be a real value. Both run before discovery so
+    # they land in the journal ahead of any device chatter.
+    ensure_settings_backup(JSON_FILE_PATH)
+    audit_stored_presets(JSON_FILE_PATH)
 
     # Fail-safe: clear any stale ready_to_run persisted from a previous session
     # BEFORE discovery/restore. The TCP server is a separate process that streams
