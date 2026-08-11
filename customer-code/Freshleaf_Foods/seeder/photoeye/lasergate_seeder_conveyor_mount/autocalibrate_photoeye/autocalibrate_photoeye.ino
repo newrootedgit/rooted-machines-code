@@ -966,6 +966,20 @@ void loop() {
       prevMainTrigCal = mainTriggered;
   }
 
+  // Push calibration state transitions the instant they happen, on top of the
+  // 1s periodic in the telemetry block. A tray dwell is routinely shorter than
+  // STATUS_INTERVAL_MS, so the periodic alone would drop CAL_MEASURING between
+  // two ticks and the Touch Encoder would jump from "Run Tray" straight to
+  // "Calibrated" — the operator never sees that the machine registered the
+  // tray. Edge-driven sends make every state the Pi renders a real one.
+  {
+      static int lastSentCalState = -1;   // sentinel: always send the first pass
+      if ((int)calState != lastSentCalState) {
+          lastSentCalState = (int)calState;
+          SendCalState();
+      }
+  }
+
   // While uncalibrated, NOTHING actuates: no valves, no roller. This is what
   // makes the first tray a pure measurement pass.
   bool calibrating     = (calState != CAL_DONE);

@@ -67,6 +67,7 @@ Wants=network-online.target
 Type=simple
 User=rooted
 WorkingDirectory=/home/rooted/te-cli
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/home/rooted/te-cli/venv/bin/python /home/rooted/te-cli/tabletop_seeder_poll.py
 Restart=always
 RestartSec=2
@@ -88,6 +89,7 @@ Wants=network-online.target
 Type=simple
 User=rooted
 WorkingDirectory=/home/rooted/te-cli
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/home/rooted/te-cli/venv/bin/python /home/rooted/te-cli/tabletop_seeder_tcp_server.py
 Restart=always
 RestartSec=2
@@ -96,6 +98,13 @@ NoNewPrivileges=true
 WantedBy=multi-user.target
 EOF
 ```
+
+> **`PYTHONUNBUFFERED=1` is not optional.** Without it Python block-buffers
+> stdout when it isn't a tty, so `print()` output sits in a buffer instead of
+> reaching the journal. The TCP server then looks silent in `journalctl` even
+> while it is running perfectly — which has already cost real debugging time,
+> because "no log output" reads as "service is broken" and sends you chasing
+> the wrong thing entirely.
 
 ## 4. Enable and start
 
@@ -205,3 +214,210 @@ sudo systemctl is-active seeder_poll.service seeder_tcp_server.service
 
 > After changing any file under `/etc/systemd/system/`, run `sudo systemctl daemon-reload` before
 > `restart`. After changing a **`.py` script**, a plain `restart` is enough (no reload needed).
+
+---
+
+## 8. SD card longevity (do this on every new Pi)
+
+**Short version: run `harden-pi.sh` and you are done.** It lives in the
+**Rooted-Web-App** repo at `pi-src/harden-pi.sh`, is safe on any Rooted Pi
+(seeder, harvester, or plain telemetry box), and is safe to run repeatedly —
+every step is idempotent and it only applies what is missing.
+
+```bash
+scp pi-src/harden-pi.sh rooted@<TAILSCALE_IP>:/tmp/
+ssh rooted@<TAILSCALE_IP> 'sudo bash /tmp/harden-pi.sh'
+```
+
+New Pis provisioned with `deploy-vector.sh` get the telemetry and journal caps
+automatically; the script is for machines already in the field, and as a
+belt-and-braces check on anything you are unsure about.
+
+The rest of this section explains *what* it does and why, so the reasoning
+survives even if the script does not.
+
+Flash **wear** is not the risk on these machines — the seeder scripts only write
+on operator actions, which works out to centuries of headroom on an industrial
+MLC card. The two things that actually kill a Pi in the field are **running out
+of disk** and **unclean power loss.**
+
+### Cap the systemd journal
+
+Journald defaults to using up to **10% of the filesystem** — about 1.6 GB on a
+16 GB card, growing silently until it gets there.
+
+```bash
+sudo mkdir -p /etc/systemd/journald.conf.d
+sudo tee /etc/systemd/journald.conf.d/size.conf >/dev/null <<'EOF'
+[Journal]
+SystemMaxUse=200M
+EOF
+sudo systemctl restart systemd-journald
+journalctl --disk-usage
+```
+
+At roughly 33 MB/month of logs, 200 MB keeps about six months of rolling
+history at a fixed, predictable cost.
+
+### Bound the telemetry log — only if this Pi runs the AWS pipeline
+
+If `rooted-ingest.service` is installed (it comes from the **Rooted-Web-App**
+repo, not this one), it appends one JSON record per ClearCore status frame to
+`/home/rooted/telemetry_log.jsonl` — **~38 MB/day, ~14 GB/year, and nothing
+truncates it.** On a 16 GB card that fills the disk in roughly eight months,
+after which writes fail and the machine misbehaves in confusing ways.
+
+Install the logrotate config from that repo
+(`pi-src/vector/rooted-telemetry.logrotate`), which bounds it to ~56 MB
+steady state. Verify with:
+
+```bash
+systemctl is-active rooted-ingest.service rooted-vector.service
+ls -lh /home/rooted/telemetry_log.jsonl*
+systemctl status logrotate.timer --no-pager     # must be active (waiting)
+```
+
+> **Check both services, not just one.** If `rooted-ingest` is running while
+> `rooted-vector` is not, the Pi writes telemetry all day that nothing ever
+> ships — and once rotation is installed, that data is silently deleted rather
+> than merely piling up. Either enable Vector, or disable the ingest service so
+> nothing is written in the first place.
+
+---
+
+## 9. Surviving power loss
+
+`harden-pi.sh` names unclean power loss as one of the two things that kill a Pi
+in the field, and then only fixes the other one. This section is the missing
+half.
+
+### What actually happened
+
+On **2026-08-11** an e-stop cut power to the Freshleaf seeder. It came back with
+**both** `tabletop_seeder_poll.py` and `tabletop_seeder_tcp_server.py`
+corrupted — runs of `0xFF` starting on clean 4 KiB boundaries, the pattern
+erased flash reads back as. Both services crash-looped on `SyntaxError` every
+two seconds (poll ~300 restarts, TCP ~450) while `systemctl is-active` reported
+`activating` rather than `failed`, because `Restart=always` keeps rescheduling.
+Twenty minutes of downtime, an hour of remote debugging.
+
+Neither file is ever written at runtime, which is the part worth understanding —
+"we barely write to the card" is not protection. Two mechanisms corrupt files
+nobody is touching:
+
+- **Pending writeback.** `scp` returns when data reaches the page cache, not the
+  card. ext4 commits every ~5 s and the card buffers on top. Power lost inside
+  that window leaves a file at its final size whose contents were never written.
+- **FTL garbage collection.** SD cards do wear-levelling and block reclamation
+  internally and invisibly. Power lost mid-reclaim can destroy blocks belonging
+  to files untouched for months. This is what power-loss-protected industrial
+  cards exist to prevent.
+
+Application code cannot fix either one. What follows shrinks the window, makes
+the damage self-healing, and protects the presets.
+
+### Deploy durably — use `deploy-seeder.sh`
+
+Never `scp` the scripts by hand. Two extra commands are the difference between a
+deploy that survives and one that exists only in RAM:
+
+```bash
+./deploy-seeder.sh rooted@100.91.169.39
+```
+
+It compiles both files locally first, copies them, **`sync`s**, verifies the
+deployed SHA-256 matches byte for byte, and refreshes the self-healing baseline
+below. A hash mismatch after `sync` means the card is corrupting writes and the
+machine needs a reflash rather than another attempt.
+
+It deliberately does **not** restart anything — restarting trips the
+`ready_to_run` fail-safe and stops the machine. It prints the restart commands
+for you to run when the machine is idle.
+
+### Self-healing — `install-seeder-integrity.sh`
+
+Run once per machine:
+
+```bash
+scp install-seeder-integrity.sh rooted@<TAILSCALE_IP>:/tmp/
+ssh rooted@<TAILSCALE_IP> 'sudo bash /tmp/install-seeder-integrity.sh'
+```
+
+This keeps known-good copies of both scripts in `/opt/rooted/pristine/` and
+installs `seeder-integrity.service`, which runs before `seeder_poll` and
+`seeder_tcp_server` at every boot. If a live script no longer matches its
+pristine copy, it is restored, `sync`ed, and re-verified — and the journal says
+so. The same incident becomes a log line instead of an hour of debugging.
+
+Two details that make it a safety net rather than a footgun:
+
+- **The baseline is verified before it is trusted.** The pristine copies are on
+  the same card and just as corruptible. If `manifest.sha256` does not check
+  out, the service refuses to restore anything rather than overwriting good
+  files with damaged ones.
+- **The baseline can only be seeded from a file that compiles.** Running the
+  installer on an already-broken machine would otherwise bake the corruption in
+  permanently.
+
+> **The Pi stops being editable in place.** The live scripts must match the
+> pristine copies, so a `nano` edit on the machine survives only until the next
+> boot. That is the intended contract — the repo is the source of truth, not the
+> card. To change a script, deploy it. To experiment on the machine, run
+> `sudo systemctl disable seeder-integrity.service` first and re-enable it after.
+
+This covers the **code** only. `TE_Variable_Values.json` is never touched by the
+check — it is live state that must keep changing, and restoring it from a
+baseline would wipe the operator's presets on every boot.
+
+### Protecting the presets
+
+Two changes in `tabletop_seeder_poll.py` cover the settings file:
+
+- **The backup is created at startup if missing.** `backup_settings()` only ran
+  after an operator saved a variety, so a machine nobody had saved on had no
+  `.bak` at all — and `recover_settings_if_needed()` had nothing to restore
+  from. The recovery path existed but was disarmed, which is exactly how
+  Freshleaf was found. An existing backup is never overwritten at startup: it is
+  the last state an operator explicitly saved, and refreshing it from whatever
+  is on disk would let a damaged-but-loadable file replace a good copy.
+- **Stored values are range-checked.** Damage does not always produce
+  unparseable JSON — a corrupted block can land inside a number and leave a file
+  that loads cleanly and carries nonsense. Values are checked against the
+  `variable_ranges` block **in the settings file itself**, so a machine tuned on
+  site is judged by its own limits. Out-of-range values are reported at startup;
+  a garbled encoder read is refused rather than persisted, leaving the previous
+  preset in place.
+
+> Note that the delay and duration fields legitimately go **negative** —
+> they are offsets, with a declared range of `-100..100`. Any "nothing can be
+> negative" rule would reject valid presets. This is why the check reads the
+> declared ranges rather than hardcoding assumptions.
+
+### What this still does not fix
+
+None of the above stops the card's garbage collection from corrupting blocks
+nobody touched. Software can shrink the window, make the code self-healing, and
+protect the presets — but only two things remove the mechanism:
+
+1. **Keep the Pi powered through an e-stop.** An e-stop's safety function is
+   removing power from hazardous motion, not from the control computer; PLCs
+   stay powered while the safety relay drops the motor contactor. If the Pi sits
+   on the load side of that contactor, moving it to the always-on supply makes
+   e-stop presses stop being power events at all. Needs sign-off from whoever
+   owns the safety circuit, but it does not weaken the e-stop.
+2. **Hold-up power.** A UPS/supercap HAT with a GPIO "power good" line and a
+   unit that runs `systemctl poweroff` when it drops. Ten seconds of hold-up
+   turns every power cut into a clean shutdown.
+
+At the next reflash, use an industrial card with power-loss protection, or boot
+from a USB SSD. Consumer SD is the wrong part for a machine whose power gets
+yanked by design.
+
+### Power loss
+
+The seeder scripts write `TE_Variable_Values.json` atomically (temp file →
+`fsync` → `os.replace` → directory `fsync`) and keep a `.bak` alongside it that
+is restored automatically at startup if the live file is unreadable. Nothing
+extra to configure — but **never** add code that rewrites that file with a
+plain `open(path, "w")`. That truncates before writing, and a power cut in the
+window destroys every variety preset on the machine.
