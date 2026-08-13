@@ -63,8 +63,8 @@ def load_state() -> Dict:
         "1": {
           "roller_speed": int (0-250),
           "belt_speed": int (0-20),
-          "roller_start_delay": int (-100..+100),
-          "roller_stop_delay": int (-100..+100)
+          "roller_start_delay": int (-20..+20),
+          "roller_stop_delay": int (-20..+20)
         },
         "2": { ... },
         ...
@@ -157,7 +157,7 @@ def serve():
                     #
                     # Fields 8 and 9 land on the sketch's
                     # user_roller_start_mod_value / user_roller_end_mod_value,
-                    # which are OFFSETS — hence the -100..+100 range and hence
+                    # which are OFFSETS — hence the +-20 range (one unit = 100 ms) and hence
                     # roller_start_delay / roller_stop_delay mapping cleanly
                     # onto what the sketch already called roller_delay and
                     # roller_duration.

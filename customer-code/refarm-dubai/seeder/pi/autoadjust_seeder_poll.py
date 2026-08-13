@@ -75,8 +75,18 @@ SHUTDOWN_REQUEST_PATH = "/run/rooted/shutdown-request"
 DEFAULT_VARIABLE_RANGES = {
     "roller_speed":       {"min": 0,    "max": 250},
     "belt_speed":         {"min": 0,    "max": 20},
-    "roller_start_delay": {"min": -100, "max": 100},
-    "roller_stop_delay":  {"min": -100, "max": 100},
+    # +-20, not +-100. The sketch multiplies these by 100 to get milliseconds
+    # (see user_roller_start_mod_value in tabletop_seeder_photoeye.ino), so one
+    # unit is 100 ms and this range is +-2 seconds. The old +-100 gave the
+    # operator +-10 seconds of authority over roller timing, which is far more
+    # than the adjustment is for and makes the encoder fiddly to dial in.
+    #
+    # If you widen this, widen the screen 16 and 40 widget limits in GUIDE to
+    # match — a value the encoder allows but this file rejects is refused on
+    # save, and the only sign of it is a REFUSED line in the journal that
+    # nobody at the machine is reading.
+    "roller_start_delay": {"min": -20, "max": 20},
+    "roller_stop_delay":  {"min": -20, "max": 20},
 }
 
 # Irrigation and misting timing. The machine HAS both, but they are deliberately
@@ -537,7 +547,7 @@ def preset_issues(values: Dict, ranges: Dict) -> list:
 
     Only fields the settings file declares a range for are checked, and only
     against that declared range. Note the two delays are offsets and
-    legitimately go negative (-100..100), so the sign of a value says nothing
+    legitimately go negative (-20..20), so the sign of a value says nothing
     on its own — a "reject anything below zero" rule would be wrong here.
     """
     issues = []
@@ -593,7 +603,7 @@ def save_variety_data(
     key = str(int(variety_index))
     # No clamp on roller_stop_delay. The harvester pinned this field to 0-3
     # because it was an airknife MODE — an enum, where anything else was
-    # meaningless. Here it is a signed offset in -100..+100, and the old clamp
+    # meaningless. Here it is a signed offset in -20..+20, and the old clamp
     # would have turned every negative value into 0 and capped the rest at 3,
     # on save, with nothing in the log to say why the machine ignored what the
     # operator entered.
@@ -1194,7 +1204,7 @@ def monitor_touch_encoder_loop():
             roller_speed = get_variable(6, 1)       # roller speed
             belt_speed = get_variable(3, 1)         # belt speed
             roller_start_delay = get_variable(16, 1)     # roller start delay
-            roller_stop_delay = get_variable(40, 1)    # roller stop delay (-100..+100)
+            roller_stop_delay = get_variable(40, 1)    # roller stop delay (-20..+20, one unit = 100 ms)
 
             if None not in (
                 variety_index,
