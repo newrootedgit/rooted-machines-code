@@ -1,0 +1,19 @@
+# Shell scripts in this repo are written on Windows and executed on Linux Pis.
+#
+# git config core.autocrlf is true on the Windows workstation, so without this
+# rule every checkout hands the .sh files CRLF endings. bash on the Pi then
+# reads the trailing carriage return as part of the command and the script dies
+# on its first line:
+#
+#     /tmp/harden-pi.sh: line 45: $'\r': command not found
+#     : invalid option namene 46: set: pipefail
+#
+# That is exactly as confusing as it looks, and it has already cost a debugging
+# session mid-deploy. Force LF for shell scripts regardless of platform.
+*.sh text eol=lf
+
+# Deliberately NOT normalising *.py here. Python is indifferent to line endings,
+# and rewriting the deployed scripts would change their SHA-256 — which is what
+# the integrity checker compares against its pristine baseline on each machine.
+# Changing every seeder's hash to tidy up whitespace is not a trade worth making
+# while those machines are in production.

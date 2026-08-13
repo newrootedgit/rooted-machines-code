@@ -1,0 +1,170 @@
+{
+    "ready_to_run": false,
+    "active_variety": null,
+    "variable_ranges": {
+        "roller_speed": {
+            "min": 0,
+            "max": 250
+        },
+        "belt_speed": {
+            "min": 0,
+            "max": 20
+        },
+        "roller_start_delay": {
+            "min": -20,
+            "max": 20
+        },
+        "roller_stop_delay": {
+            "min": -20,
+            "max": 20
+        }
+    },
+    "fixed_timings": {
+        "irrigation_delay": 0,
+        "irrigation_duration": 0,
+        "misting_delay": 0,
+        "misting_duration": 0
+    },
+    "variety_names": {
+        "1": "1",
+        "2": "2",
+        "3": "3",
+        "4": "4",
+        "5": "5",
+        "6": "6",
+        "7": "7",
+        "8": "8",
+        "9": "9",
+        "10": "10",
+        "11": "11",
+        "12": "12",
+        "13": "13",
+        "14": "14",
+        "15": "15",
+        "16": "16",
+        "17": "17",
+        "18": "18",
+        "19": "19",
+        "20": "20"
+    },
+    "1": {
+        "roller_speed": 50,
+        "belt_speed": 10,
+        "roller_start_delay": 0,
+        "roller_stop_delay": 0
+    },
+    "2": {
+        "roller_speed": 50,
+        "belt_speed": 10,
+        "roller_start_delay": 0,
+        "roller_stop_delay": 0
+    },
+    "3": {
+        "roller_speed": 50,
+        "belt_speed": 10,
+        "roller_start_delay": 0,
+        "roller_stop_delay": 0
+    },
+    "4": {
+        "roller_speed": 50,
+        "belt_speed": 10,
+        "roller_start_delay": 0,
+        "roller_stop_delay": 0
+    },
+    "5": {
+        "roller_speed": 50,
+        "belt_speed": 10,
+        "roller_start_delay": 0,
+        "roller_stop_delay": 0
+    },
+    "6": {
+        "roller_speed": 50,
+        "belt_speed": 10,
+        "roller_start_delay": 0,
+        "roller_stop_delay": 0
+    },
+    "7": {
+        "roller_speed": 50,
+        "belt_speed": 10,
+        "roller_start_delay": 0,
+        "roller_stop_delay": 0
+    },
+    "8": {
+        "roller_speed": 50,
+        "belt_speed": 10,
+        "roller_start_delay": 0,
+        "roller_stop_delay": 0
+    },
+    "9": {
+        "roller_speed": 50,
+        "belt_speed": 10,
+        "roller_start_delay": 0,
+        "roller_stop_delay": 0
+    },
+    "10": {
+        "roller_speed": 50,
+        "belt_speed": 10,
+        "roller_start_delay": 0,
+        "roller_stop_delay": 0
+    },
+    "11": {
+        "roller_speed": 50,
+        "belt_speed": 10,
+        "roller_start_delay": 0,
+        "roller_stop_delay": 0
+    },
+    "12": {
+        "roller_speed": 50,
+        "belt_speed": 10,
+        "roller_start_delay": 0,
+        "roller_stop_delay": 0
+    },
+    "13": {
+        "roller_speed": 50,
+        "belt_speed": 10,
+        "roller_start_delay": 0,
+        "roller_stop_delay": 0
+    },
+    "14": {
+        "roller_speed": 50,
+        "belt_speed": 10,
+        "roller_start_delay": 0,
+        "roller_stop_delay": 0
+    },
+    "15": {
+        "roller_speed": 50,
+        "belt_speed": 10,
+        "roller_start_delay": 0,
+        "roller_stop_delay": 0
+    },
+    "16": {
+        "roller_speed": 50,
+        "belt_speed": 10,
+        "roller_start_delay": 0,
+        "roller_stop_delay": 0
+    },
+    "17": {
+        "roller_speed": 50,
+        "belt_speed": 10,
+        "roller_start_delay": 0,
+        "roller_stop_delay": 0
+    },
+    "18": {
+        "roller_speed": 50,
+        "belt_speed": 10,
+        "roller_start_delay": 0,
+        "roller_stop_delay": 0
+    },
+    "19": {
+        "roller_speed": 50,
+        "belt_speed": 10,
+        "roller_start_delay": 0,
+        "roller_stop_delay": 0
+    },
+    "20": {
+        "roller_speed": 50,
+        "belt_speed": 10,
+        "roller_start_delay": 0,
+        "roller_stop_delay": 0
+    }
+}
