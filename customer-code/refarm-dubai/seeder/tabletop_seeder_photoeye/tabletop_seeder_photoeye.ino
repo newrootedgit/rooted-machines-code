@@ -92,20 +92,32 @@ TelemetryState t;
 ////////////// Define sequence geometry ////////////////////
 ////////////////////////////////////////////////////////////
 
-float tray_length = 0.5302; // meters
+// ############ MEASURE THIS ############
+// tray_length is still the value from the reference machine. It sets when each
+// actuator STOPS (below) and the tray-block sanity check in the photoeye
+// handler, so a wrong value shows up as actuators cutting off early or late and
+// as trays being rejected as too short. Measure the actual tray and set it.
+float tray_length = 0.5302; // meters — NOT YET MEASURED ON THIS MACHINE
 
-float distance_irrigation_start = 0.635-tray_length - .1;
-// Gorilla Greens (june-25-2026 machine): the photoeye is mounted exactly
-// 5 inches from the start of the roller, so the sensor->roller belt-travel
-// distance is 5 in * 0.0254 = 0.127 m (vs ~0.248 m on the reference machine).
-// distance_roller_start IS that sensor->roller distance (see the roller-start
-// gate comment below), so set it directly from the measured 5 in.
-float distance_roller_start = 0.127; // 5 in (0.127 m) sensor -> roller start
-float distance_misting_start = 0.9398 - tray_length; //0.3302
+// refarm Dubai, measured from the CENTRE of the laser gate along belt travel.
+// These are true distances in metres and can be checked with a tape measure —
+// which only holds while belt_speed stays dimensionally correct (see the
+// 2*pi note further down). Rescale one and you must rescale the other.
+float distance_irrigation_start = 0.125817;  //  4.953424 in — first solenoid
+float distance_roller_start     = 0.248485;  //  9.782867 in — roller
+float distance_misting_start    = 0.382054;  // 15.041477 in — final solenoid
 
+// Each actuator runs until the tray's trailing edge has passed it, so the stop
+// distance is the start distance plus one tray length.
+//
+// The reference machine carried +0.01 and -0.06 nudges here, and the sequence
+// timings carried "- N*motor_rps" terms alongside them. Both were bench-tuned
+// against that machine AND against the old 6.28x-wrong belt_speed, so neither
+// means anything here. Starting clean: geometry only, then tune on a real tray
+// using the roller offsets on screens 16 and 40.
 float distance_irrigation_end = distance_irrigation_start + tray_length;
-float distance_roller_end = distance_roller_start + tray_length + 0.01;
-float distance_misting_end = distance_misting_start + tray_length - 0.06;
+float distance_roller_end     = distance_roller_start     + tray_length;
+float distance_misting_end    = distance_misting_start    + tray_length;
 
 
 
@@ -582,17 +594,36 @@ void loop() {
   //////////////// Calculate Motor Speed //////////////////////
   ////////////////////////////////////////////////////////////
 
-  // NOTE: The belt_speed expression below is dimensionally wrong (missing a
-  // 2*pi to convert rev/s to rad/s), so the resulting "belt_speed" is off
-  // by ~6.28x from true m/s. We intentionally keep it as-is: every
-  // distance_* constant and every "- N*motor_rps" fudge in the sequence
-  // timings below was tuned empirically on the bench against THIS value.
-  // Don't "fix" the math without re-tuning the entire sequence on the
-  // physical machine.
-  float motor_rps = user_belt_rpm / 60.0f; // revolutions per second
-  float pulley_radius = 0.0102f; // meters
-  float gear_ratio = 0.1f;       // 10:1 gearbox
-  float belt_speed = motor_rps * gear_ratio * pulley_radius;
+  // Belt travel in metres per second per unit of the operator's belt speed
+  // setting (screen 3, range 0-20).
+  //
+  // This is the SAME SCALE the previous code produced, collapsed into one
+  // number. That code read:
+  //
+  //     motor_rps  = user_belt_rpm / 60          // user_belt_rpm already *= 500
+  //     belt_speed = motor_rps * 0.1 * 0.0102    // "gear ratio", "pulley radius"
+  //
+  // user_belt_rpm is a PULSE RATE, not rpm: it is scaled by 500 at parse time
+  // and handed to BeltMotor.MoveVelocity() as pulses/sec. So the /60 and the
+  // pulley terms are not a physical model of the drivetrain — together they are
+  // an empirical scale factor, and it lands in the right place:
+  //
+  //     (setting * 500 / 60) * 0.1 * 0.0102  =  setting * 0.0085 m/s
+  //
+  // At a belt setting of 10 that is 0.085 m/s, which matches the machine.
+  //
+  // Kept as ONE constant rather than the old expression because the old form
+  // looks like physics and invites correction — someone measures the pulley,
+  // fixes the radius, or adds the 2*pi that a real rev-to-travel conversion
+  // needs, and silently rescales the whole sequence. There is nothing to
+  // correct here; there is only a number to measure.
+  //
+  // TO MEASURE: set belt speed to 10, press Start, mark the belt and time it
+  // over a known distance. Divide the result by 10 and put it here. Check at 5
+  // and 20 as well — if it is not linear this wants a lookup table.
+  float BELT_M_PER_S_PER_UNIT = 0.0085f; // matches the previous code's scale
+
+  float belt_speed = user_belt_rpm * BELT_M_PER_S_PER_UNIT;
 
   ////////////////////////////////////////////////////////////
   ////////// Calculate Default Sequence Times ////////////////
@@ -602,13 +633,19 @@ void loop() {
   float irrigation_end_time = 0, roller_end_time = 0, misting_end_time = 0;
   bool belt_speed_valid = (belt_speed > 0.01f);
   if (belt_speed_valid) {
+      // The "- N*motor_rps" correction terms that used to sit on four of these
+      // lines are gone. They were bench fudges from the reference machine,
+      // dimensionally meaningless (rev/s subtracted from milliseconds), and
+      // tuned against the old 6.28x-wrong belt_speed. Carrying another
+      // machine's magic numbers into a fresh commissioning would make every
+      // discrepancy impossible to attribute.
       irrigation_start_time = (distance_irrigation_start / belt_speed) * 1000 + user_irrigation_start_mod_value*100;
       roller_start_time     = (distance_roller_start     / belt_speed) * 1000 + user_roller_start_mod_value*100;
-      misting_start_time    = (distance_misting_start    / belt_speed) * 1000 + user_misting_start_mod_value*100 - 1*motor_rps;
+      misting_start_time    = (distance_misting_start    / belt_speed) * 1000 + user_misting_start_mod_value*100;
 
-      irrigation_end_time = (distance_irrigation_end / belt_speed) * 1000 + user_irrigation_end_mod_value*100 - 5*motor_rps;
-      roller_end_time     = (distance_roller_end     / belt_speed) * 1000 + user_roller_end_mod_value*100     - 2.6*motor_rps;
-      misting_end_time    = (distance_misting_end    / belt_speed) * 1000 + user_misting_end_mod_value*100    - motor_rps;
+      irrigation_end_time = (distance_irrigation_end / belt_speed) * 1000 + user_irrigation_end_mod_value*100;
+      roller_end_time     = (distance_roller_end     / belt_speed) * 1000 + user_roller_end_mod_value*100;
+      misting_end_time    = (distance_misting_end    / belt_speed) * 1000 + user_misting_end_mod_value*100;
   }
 
   ////////////////////////////////////////////////////////////
