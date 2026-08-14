@@ -623,7 +623,16 @@ void loop() {
   // and 20 as well — if it is not linear this wants a lookup table.
   float BELT_M_PER_S_PER_UNIT = 0.0085f; // matches the previous code's scale
 
-  float belt_speed = user_belt_rpm * BELT_M_PER_S_PER_UNIT;
+  // The constant above is m/s per unit of the OPERATOR'S SETTING (0-20), but
+  // user_belt_rpm is that setting already multiplied by 500 at parse time — it
+  // is a pulse rate, not the setting. So the 500 has to come back out here.
+  // The old expression consumed it implicitly via `motor_rps = user_belt_rpm /
+  // 60`; collapsing the expression dropped that step, which made belt_speed
+  // 500x too fast and squeezed the whole sequence into ~21 ms — shorter than
+  // one pass of this loop, so the roller was commanded on and off inside a
+  // single tick and never spun up.
+  float belt_setting = user_belt_rpm / 500.0f;
+  float belt_speed = belt_setting * BELT_M_PER_S_PER_UNIT;
 
   ////////////////////////////////////////////////////////////
   ////////// Calculate Default Sequence Times ////////////////
