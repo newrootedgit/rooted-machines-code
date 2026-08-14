@@ -12,6 +12,18 @@ int accelerationLimit = 100000; // pulses per sec^2
 
 #define inputPin1 IO3  // Tray photoeye
 
+// Raw level IO3 reads when the beam is BROKEN by a tray. This machine's gate is
+// light-on (it drives the input HIGH while the beam is clear and releases it
+// when a tray interrupts), so blocked = LOW. Swap to HIGH if the sensor, its
+// output type, or its light-on/dark-on jumper is ever changed.
+//
+// Everything downstream is written in terms of "is a tray blocking the beam",
+// so this is normalized once at the read and nowhere else — see inputState in
+// loop(). Do NOT fix a polarity problem by flipping the edge test instead: the
+// roller-start gate reads the same signal as a level, and inverting only the
+// edge would leave the gate backwards and suppress the roller on every tray.
+#define PHOTOEYE_BLOCKED_LEVEL LOW
+
 #define relay0Pin IO0 // Irrigation output
 #define relay1Pin IO1 // Misting output
 
@@ -661,7 +673,12 @@ void loop() {
   /////////////// Sequence Execution Logic ///////////////////
   ////////////////////////////////////////////////////////////
 
-  bool inputState = digitalRead(inputPin1);
+  // TRUE means a tray is blocking the beam. Polarity is normalized here, at the
+  // single point the pin is read, so every downstream test below — the start
+  // edge, the trailing-edge block measurement, the roller-start gate and the
+  // tray counter — reads as plain "tray present" regardless of how the sensor
+  // is wired. See PHOTOEYE_BLOCKED_LEVEL up top.
+  bool inputState = (digitalRead(inputPin1) == PHOTOEYE_BLOCKED_LEVEL);
   static bool lastPhotoeyeState = false;
 
   // Roller-start gate state (reset each sequence). The roller is committed once
