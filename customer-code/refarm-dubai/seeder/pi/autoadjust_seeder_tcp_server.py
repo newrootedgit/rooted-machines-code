@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 import os
 import json
+import time
 import socket
 import fcntl
+import threading
 from typing import Dict
 
 # ========================
@@ -12,6 +14,13 @@ HOST = "192.168.10.1"
 PORT = 8888
 JSON_FILE_PATH = "/home/rooted/te-cli/TE_Variable_Values.json"
 LOCK_FILE_PATH = JSON_FILE_PATH + ".lock"
+
+# How often the shared JSON is re-read to see whether anything changed.
+POLL_INTERVAL_S = 0.5
+
+# Resend an unchanged snapshot this often, so a ClearCore that reconnected or
+# missed an update still converges without waiting for the next operator action.
+HEARTBEAT_INTERVAL_S = 10.0
 
 # ========================
 # Lock helpers (advisory)
@@ -135,65 +144,156 @@ def load_state() -> Dict:
         "variety_name": variety_name,
     }
 
+def build_payload() -> str:
+    """
+    Render the current shared state as one CSV line (no trailing newline).
+
+    Field order IS the contract with tabletop_seeder_photoeye.ino, which parses
+    by position — see the switch on fieldIndex in parseReceivedMessage(). The
+    sketch needs no changes to run this machine, and that only holds while these
+    eleven fields stay in this order.
+
+    Fields 8 and 9 land on the sketch's user_roller_start_mod_value /
+    user_roller_end_mod_value, which are OFFSETS — hence the +-20 range (one
+    unit = 100 ms) and hence roller_start_delay / roller_stop_delay mapping
+    cleanly onto what the sketch calls roller_delay and roller_duration.
+
+    Fields 4-7 are fixed timings with no encoder screen; see
+    ensure_fixed_timings() in the poll script.
+
+    Format: ready_to_run,active_variety,roller_speed,belt_speed,
+            irrigation_delay,irrigation_duration,
+            misting_delay,misting_duration,
+            roller_start_delay,roller_stop_delay,variety_name
+    """
+    state = load_state()
+    payload_fields = [
+        state["ready_to_run"],
+        state["active_variety"],
+        state["roller_speed"],
+        state["belt_speed"],
+        state["irrigation_delay"],
+        state["irrigation_duration"],
+        state["misting_delay"],
+        state["misting_duration"],
+        state["roller_start_delay"],
+        state["roller_stop_delay"],
+        state["variety_name"],
+    ]
+    return ",".join(str(x) for x in payload_fields)
+
+
+def enable_keepalive(conn: socket.socket) -> None:
+    """
+    Turn on TCP keepalive so a silently-dead peer — a ClearCore power cycle that
+    never sends a FIN or RST — gets torn down by the kernel rather than
+    lingering for the default ~15 minute retransmission timeout. The Linux
+    tuning probes after 3s idle, every 2s, dropping after 3 failures (~9s).
+    """
+    try:
+        conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        if hasattr(socket, "TCP_KEEPIDLE"):
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 3)
+        if hasattr(socket, "TCP_KEEPINTVL"):
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 2)
+        if hasattr(socket, "TCP_KEEPCNT"):
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+    except OSError:
+        pass
+
+
+def serve_client(conn: socket.socket, addr) -> None:
+    """
+    Hold the connection open and push a NEWLINE-TERMINATED CSV snapshot whenever
+    the payload changes, plus a heartbeat every HEARTBEAT_INTERVAL_S.
+
+    Both halves of that matter, and this server previously did neither.
+
+    It used to accept, send one payload with NO trailing newline, and close. The
+    sketch frames on '\\n' before it will call parseReceivedMessage(), so a
+    payload without one is buffered and never parsed — the machine received
+    nothing it could act on, ever, while the Pi log showed apparently healthy
+    sends. And because the socket closed after each send, the ClearCore printed
+    "Server disconnected. Attempting reconnect..." every two seconds forever.
+    """
+    conn.settimeout(5.0)
+    # Disable Nagle so these sub-100-byte updates ship immediately rather than
+    # waiting to coalesce with a next packet that may be seconds away.
+    try:
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
+
+    print(f"tcp: [persistent] client connected {addr}")
+    last_sent = None
+    last_sent_at = 0.0
+    try:
+        while True:
+            try:
+                payload = build_payload()
+            except Exception as e:
+                # Transient JSON read race — log it and retry next tick rather
+                # than dropping a working connection.
+                print(f"tcp: payload error for {addr}: {e}")
+                time.sleep(POLL_INTERVAL_S)
+                continue
+
+            now = time.monotonic()
+            changed = (payload != last_sent)
+            heartbeat = (now - last_sent_at) >= HEARTBEAT_INTERVAL_S
+            if changed or heartbeat:
+                try:
+                    conn.sendall((payload + "\n").encode("utf-8"))
+                except (BrokenPipeError, ConnectionResetError, socket.timeout, OSError) as e:
+                    print(f"tcp: client {addr} disconnected: {e}")
+                    return
+                if changed:
+                    print(f"tcp: {addr} <- '{payload}'")
+                last_sent = payload
+                last_sent_at = now
+            time.sleep(POLL_INTERVAL_S)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def serve():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         # Allow quick restart after crash
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind((HOST, PORT))
         s.listen(5)
-        print(f"tcp: serving on {HOST}:{PORT}")
+        print(f"tcp: [persistent] serving on {HOST}:{PORT}")
+
+        current_conn = None
 
         while True:
             conn, addr = s.accept()
-            with conn:
+            enable_keepalive(conn)
+
+            # Single-client deployment: a new connection almost always means the
+            # ClearCore rebooted and reconnected while we still held its stale
+            # socket. Drop the previous one so the fresh connection wins
+            # immediately instead of waiting for a timeout. The old
+            # serve_client thread then errors on its next send and exits.
+            if current_conn is not None:
+                print(f"tcp: new client {addr}, dropping previous connection")
                 try:
-                    state = load_state()
+                    current_conn.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                try:
+                    current_conn.close()
+                except OSError:
+                    pass
 
-                    # CSV payload in a fixed order. This IS the contract with
-                    # tabletop_seeder_photoeye.ino, which parses by position —
-                    # see the switch on fieldIndex in parseReceivedMessage().
-                    # The sketch needs no changes to run this machine, and that
-                    # only holds while these eleven fields stay in this order.
-                    #
-                    # Fields 8 and 9 land on the sketch's
-                    # user_roller_start_mod_value / user_roller_end_mod_value,
-                    # which are OFFSETS — hence the +-20 range (one unit = 100 ms) and hence
-                    # roller_start_delay / roller_stop_delay mapping cleanly
-                    # onto what the sketch already called roller_delay and
-                    # roller_duration.
-                    #
-                    # Fields 4-7 are fixed timings with no encoder screen; see
-                    # ensure_fixed_timings() in the poll script.
-                    #
-                    # Format: ready_to_run,active_variety,roller_speed,belt_speed,
-                    #         irrigation_delay,irrigation_duration,
-                    #         misting_delay,misting_duration,
-                    #         roller_start_delay,roller_stop_delay,variety_name
-                    payload_fields = [
-                        state["ready_to_run"],
-                        state["active_variety"],
-                        state["roller_speed"],
-                        state["belt_speed"],
-                        state["irrigation_delay"],
-                        state["irrigation_duration"],
-                        state["misting_delay"],
-                        state["misting_duration"],
-                        state["roller_start_delay"],
-                        state["roller_stop_delay"],
-                        state["variety_name"],
-                    ]
-                    payload = ",".join(str(x) for x in payload_fields)
+            current_conn = conn
+            threading.Thread(
+                target=serve_client, args=(conn, addr), daemon=True
+            ).start()
 
-                    conn.sendall(payload.encode("utf-8"))
-
-                    print(f"tcp: {addr} -> '{payload}'")
-
-                except Exception as e:
-                    try:
-                        conn.sendall(b"ERR")
-                    except Exception:
-                        pass
-                    print(f"tcp: error serving {addr}: {e}")
 
 if __name__ == "__main__":
     serve()

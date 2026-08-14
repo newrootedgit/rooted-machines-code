@@ -1089,8 +1089,18 @@ def monitor_touch_encoder_loop():
             save_active_variety(variety_index)  # Save active variety to JSON
 
             saved_data = load_variety_data()
-            # Display which variety is loaded on screen 18
-            set_variable(18, 2, variety_index)
+
+            # Display which variety is loaded on screen 18, by NAME on var 1.
+            #
+            # The harvester also wrote the numeric index to var 2 here. On this
+            # machine var 2 carries the Start/Stop button's static label, so
+            # that write stamped a number over it — the button read "0" instead
+            # of its text. Var 1 already shows the variety, so nothing is lost.
+            #
+            # Screen 18's variables on this machine:
+            #   var 1 -> variety name (written here)
+            #   var 2 -> button label, GUIDE-owned — POLL MUST NOT WRITE IT
+            #   var 6 -> press latch (written by the run-screen branch)
             write_variety_to_screen(variety_index, CONFIRM_VARIETY_SCREEN, CONFIRM_VARIETY_VAR)
 
             key = str(variety_index)
