@@ -393,10 +393,69 @@ Two changes in `tabletop_seeder_poll.py` cover the settings file:
 > negative" rule would reject valid presets. This is why the check reads the
 > declared ranges rather than hardcoding assumptions.
 
+### The Shut Down button — HMI screen 2
+
+Not every power cut on this machine is an e-stop. Most of them are somebody
+pulling the plug at the end of the shift, and that one is entirely avoidable:
+the operator just has no way to halt the Pi from the HMI. Screen 2 carries a
+**Shut Down** button that gives them one.
+
+```
+operator taps Shut Down  ->  GUIDE writes 1 into screen 2 / var 5
+poll sees the latch      ->  clears ready_to_run  (machine parked first)
+                         ->  writes /run/rooted/shutdown-request   (tmpfs)
+                         ->  rooted-shutdown.path notices
+                         ->  rooted-shutdown.service (root) flushes, syncs, halts
+```
+
+Install the privileged half once per machine:
+
+```bash
+scp install-shutdown-button.sh rooted@<host>:/tmp/
+ssh -t rooted@<host> 'sudo bash /tmp/install-shutdown-button.sh'
+```
+
+It is idempotent — re-running it only applies what is missing. It does not test
+itself, because the test halts the machine.
+
+**The operator routine:**
+
+1. press **Shut Down** on screen 2
+2. wait for the Touch Encoder screen to go dark
+3. unplug
+
+The screen going dark is the safe-to-unplug signal: a Pi 5 cuts USB power when
+it halts and the encoder is USB powered. Confirm that on the bench for this
+carrier board before teaching it as the procedure.
+
+**Why poll cannot just call `poweroff`.** It runs as `rooted` with
+`NoNewPrivileges=true` (see section 3) and should stay that way — a
+machine-control service does not need the right to switch the computer off. It
+writes an unprivileged flag into `/run`; a systemd `.path` unit bridges that to
+the root action. `/run` is tmpfs, so the request never touches the card and is
+cleared at boot, which means a request that somehow survived a halt cannot
+re-trigger a shutdown on the next start.
+
+**The stale-press guard matters here.** The encoder dies with the Pi, so a press
+that was never consumed can still be sitting in var 5 on the next boot. Poll
+zeroes the latch on arrival at screen 2 and skips one read, so the leftover
+cannot fire — otherwise the machine would shut itself down the moment anyone
+opened the wrong screen. Same guard as screens 18 and 19.
+
+If the request file cannot be written, poll logs `THE MACHINE WILL NOT HALT` and
+re-arms the button rather than latching. Check for that line before assuming the
+button works:
+
+```bash
+journalctl -u seeder_poll.service -b | grep -i shutdown
+journalctl -u rooted-shutdown.service -b -1 --no-pager   # after it comes back
+```
+
 ### What this still does not fix
 
-None of the above stops the card's garbage collection from corrupting blocks
-nobody touched. Software can shrink the window, make the code self-healing, and
+The Shut Down button removes the daily unplug as a power event, and none of
+the above stops the card's garbage collection from corrupting blocks nobody
+touched. Software can shrink the window, make the code self-healing, and
 protect the presets — but only two things remove the mechanism:
 
 1. **Keep the Pi powered through an e-stop.** An e-stop's safety function is
