@@ -63,6 +63,46 @@ STATE_BTN_PRESS_VAR = 5
 STATUS_TEXT_RUNNING = "Active"
 STATUS_TEXT_STOPPED = "Paused"
 
+# Shutdown button, on screen 2. Configured in GUIDE with Action="Set value"
+# writing 1 into var 5 (default 0), exactly like the run screen's toggle. Poll
+# sees nonzero, parks the machine and asks the OS to halt.
+#
+# Var 5 here is NOT the same variable as STATE_BTN_PRESS_VAR — that one is var 5
+# on screen 18. Same id, different screen, different widget.
+#
+# WHY: this machine is unplugged at the end of the day. Without a clean halt
+# first that is an unclean shutdown a few hundred times a year, and one of those
+# is what corrupted both of this Pi's Python scripts on 2026-08-11 — runs of
+# 0xFF on clean 4 KiB boundaries, both services crash-looping. The routine this
+# supports: press Shut Down, wait for the encoder screen to go dark, pull the
+# plug.
+SHUTDOWN_SCREEN        = 2
+SHUTDOWN_BTN_PRESS_VAR = 5  # numeric latch, default 0, set to 1 on button press
+
+# String var on screen 2 that poll writes progress into, so the operator can see
+# the machine responding. The halt takes a few seconds and the encoder shows
+# nothing on its own, which reads as a button that did not work — and an
+# operator who believes that reaches for the plug, which is the exact unclean
+# shutdown this feature exists to prevent.
+#
+# This is the STRING variable the screen 2 text field is bound to in GUIDE.
+# Keep the field wide enough for the longest string below (16 characters);
+# screen 19's field clips at about 11.
+SHUTDOWN_STATUS_VAR = 2
+
+# Progress strings. IDLE is written on arrival so a message left over from a
+# previous visit does not greet the next operator. It must match the static
+# label the GUIDE project puts on this field, or the text the operator sees
+# vanishes a fraction of a second after they navigate to the screen.
+SHUTDOWN_TEXT_IDLE   = "Shut Down"
+SHUTDOWN_TEXT_BUSY   = "Shutting down"
+SHUTDOWN_TEXT_FAILED = "HALT FAILED"
+
+# Where the halt is requested. /run is tmpfs, so the request never touches
+# storage — and it is cleared at boot for free, which means a request that
+# somehow survived cannot re-trigger a shutdown on the next start.
+SHUTDOWN_REQUEST_PATH = "/run/rooted/shutdown-request"
+
 # Calibration screen. The button writes 1 into CAL_TRIGGER_VAR the same way the
 # run screen's toggle does; poll relays it to the ClearCore as calibrate_request
 # in the JSON and renders the controller's reported cal_state back here.
@@ -579,6 +619,34 @@ def save_active_variety(variety_index: int):
     locked_atomic_write_json(JSON_FILE_PATH, data)
     print(f"Set active_variety = {variety_index}")
 
+def request_shutdown() -> bool:
+    """
+    Ask the system to halt, without giving this process the privilege to do it.
+
+    poll runs as `rooted` under NoNewPrivileges=true, so it cannot call poweroff
+    and should not be able to — a machine-control service does not need the
+    right to switch the computer off. It writes a flag into /run instead; a
+    systemd .path unit watches for that file and triggers a root oneshot that
+    flushes the journal, syncs and halts. See install-shutdown-button.sh.
+
+    Returning False matters: if the request cannot be written, the operator is
+    about to unplug a machine that is still running, which is exactly the
+    unclean shutdown this whole button exists to avoid. Say so in the journal.
+    """
+    try:
+        os.makedirs(os.path.dirname(SHUTDOWN_REQUEST_PATH), exist_ok=True)
+        with open(SHUTDOWN_REQUEST_PATH, "w") as f:
+            f.write("requested from the Touch Encoder shutdown button\n")
+            f.flush()
+            os.fsync(f.fileno())
+        print(f"shutdown: requested via {SHUTDOWN_REQUEST_PATH}")
+        return True
+    except OSError as e:
+        print(f"ERROR: shutdown requested but {SHUTDOWN_REQUEST_PATH} could not "
+              f"be written ({e}). THE MACHINE WILL NOT HALT — do not unplug it "
+              f"until it has been shut down another way.")
+        return False
+
 def ready_to_run_toggle(flag: bool):
     """
     Track ready_to_run in JSON. The actual machine start logic lives on the
@@ -780,9 +848,94 @@ def monitor_touch_encoder_loop():
     # Calibrated walkthrough. See new_cal_ui().
     cal_ui = new_cal_ui()
 
+    # Shutdown screen state. None means "was not on screen 2 last tick", which
+    # doubles as the just-arrived signal for the stale-press guard below.
+    last_shutdown_seen = None
+
+    # Latches once the operator has asked to shut down. The loop runs every
+    # 300 ms and the machine takes a few seconds to halt, so without this the
+    # request would be re-issued a dozen times on the way down.
+    shutdown_requested = False
+
+    # Drives the animated dots on the shutdown screen while the machine halts.
+    shutdown_tick = 0
+
     while True:
         # Get current screen (with retries)
         active_screen = safe_get_screen()
+
+        # ---------------------------------------------
+        # Screen 2: Shut Down button
+        # ---------------------------------------------
+        # Handled before anything else so the halt is not delayed behind
+        # encoder round-trips, and `continue` because nothing else is worth
+        # doing on the way down.
+        if active_screen == ScreenID(SHUTDOWN_SCREEN):
+            # Stale-press guard, same as the run and calibration screens: zero
+            # the latch on arrival and skip one read. The encoder is USB powered
+            # and dies with the Pi, so a press left unconsumed as the machine
+            # halted could otherwise fire the instant someone opens screen 2 on
+            # the next boot — a machine that shuts itself down when you look at
+            # the wrong screen.
+            shutdown_first_entry = last_shutdown_seen is None
+            if shutdown_first_entry:
+                set_variable(SHUTDOWN_SCREEN, SHUTDOWN_BTN_PRESS_VAR, 0)
+                # Clear anything left from a previous visit or a failed halt,
+                # so the operator is never met by a stale "Shutting down".
+                set_string_var(SHUTDOWN_SCREEN, SHUTDOWN_STATUS_VAR,
+                               SHUTDOWN_TEXT_IDLE)
+            last_shutdown_seen = True
+
+            # Already on the way down. Keep the dots moving rather than holding
+            # one static string: a frozen message is indistinguishable from a
+            # hung machine, and the whole point is to show it is still working.
+            # Nothing else runs here — the halt is the only thing left to do.
+            if shutdown_requested:
+                shutdown_tick += 1
+                set_string_var(
+                    SHUTDOWN_SCREEN, SHUTDOWN_STATUS_VAR,
+                    SHUTDOWN_TEXT_BUSY + ("." * (shutdown_tick % 4)))
+                time.sleep(POLL_INTERVAL_SEC)
+                continue
+
+            try:
+                pressed = 0 if shutdown_first_entry else safe_get_var(
+                    SHUTDOWN_SCREEN, SHUTDOWN_BTN_PRESS_VAR)
+            except Exception:
+                pressed = 0
+
+            if pressed:
+                print("shutdown: operator pressed the shut down button")
+                # Repaint BEFORE doing any work. set_string_var is a single USB
+                # write with no read-back, so the operator sees the machine
+                # respond within one 300 ms tick instead of waiting on a JSON
+                # write and an fsync first.
+                set_string_var(SHUTDOWN_SCREEN, SHUTDOWN_STATUS_VAR,
+                               SHUTDOWN_TEXT_BUSY)
+                shutdown_requested = True
+                shutdown_tick = 0
+                # Park the machine first. The TCP server keeps streaming this
+                # JSON to the ClearCore until the moment the OS goes away, so
+                # the last thing the controller reads should say "not ready to
+                # run" rather than leaving it armed as the link disappears.
+                ready_to_run_toggle(False)
+                if not request_shutdown():
+                    # The halt will not happen. Say so on the screen — silently
+                    # returning to idle would look like the press was ignored,
+                    # and the operator would unplug a running machine.
+                    set_string_var(SHUTDOWN_SCREEN, SHUTDOWN_STATUS_VAR,
+                                   SHUTDOWN_TEXT_FAILED)
+                    # Re-arm so the operator can try again rather than being
+                    # left tapping a dead button.
+                    shutdown_requested = False
+                # Consume the press either way, so a halt that fails does not
+                # leave the latch stuck high for the retry.
+                set_variable(SHUTDOWN_SCREEN, SHUTDOWN_BTN_PRESS_VAR, 0)
+
+            time.sleep(POLL_INTERVAL_SEC)
+            continue
+        else:
+            last_shutdown_seen = None
 
         # Checked every cycle, not just on the calibration screen: the request
         # flag is relayed to the ClearCore continuously regardless of what the
