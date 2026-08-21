@@ -464,14 +464,31 @@ def set_variable(screen_id: int, var_id: int, value: int) -> bool:
     try:
         status = te.guide.set_var(ScreenID(screen_id), VariableID(var_id), VariableData(int(value)))
         time.sleep(0.2)
-        if status != Status.OK:
-            print(f"set_variable: non-OK status {status} for s{screen_id} v{var_id}")
+        # The installed te-cli's Status enum has SUCCESS and ERROR but NO OK.
+        # Naming it directly raised AttributeError on every single write — and
+        # because set_var had already run by then, the write landed and only the
+        # verification below was skipped. The machine worked while quietly
+        # losing its read-back check and logging an error per write. Resolved at
+        # runtime so this survives either spelling; same approach as the
+        # harvester and refarm seeder scripts.
+        expected_ok = getattr(Status, "SUCCESS", None) or getattr(Status, "OK", None)
+        if expected_ok is not None and status != expected_ok:
+            print(f"set_variable: non-success status {status} for s{screen_id} v{var_id}")
             return False
         got = te.guide.get_var(ScreenID(screen_id), VariableID(var_id))
-        ok = (got != Status.ERROR) and (got.to_int() == int(value))
+        ok = False
+        if got != Status.ERROR:
+            # to_int() raises ValueError on anything longer than 4 bytes, which
+            # is what a string variable reads back as. Catching it keeps a
+            # mis-typed GUIDE widget as a logged mismatch rather than an
+            # exception that takes out the caller.
+            try:
+                ok = (got.to_int() == int(value))
+            except ValueError:
+                print(f"set_variable: s{screen_id} v{var_id} did not read back as "
+                      f"a number — is it a string variable in GUIDE?")
         if not ok:
-            print(f"set_variable: verify mismatch for s{screen_id} v{var_id}: "
-                  f"got {got.to_int() if got != Status.ERROR else 'ERROR'}")
+            print(f"set_variable: verify mismatch for s{screen_id} v{var_id}")
         return ok
     except Exception as e:
         print(f"Error setting variable s{screen_id} v{var_id}: {e}")
@@ -749,8 +766,13 @@ def get_variety_name(variety_index: int) -> str:
     names = data.get("variety_names", {})
     return names.get(str(int(variety_index)), str(variety_index))
 
-def write_variety_to_screen(variety_index: int, screen_id: int = VARIETY_NAME_SCREEN, var_id: int = VARIETY_NAME_VAR):
-    """Write the variety name string to a TE screen variable."""
+def write_variety_to_screen(variety_index: int, screen_id: int = VARIETY_NAME_SCREEN, var_id: int = VARIETY_NAME_VAR) -> bool:
+    """
+    Write the variety name string to a TE screen variable.
+
+    Returns whether the write actually went out, so the caller can avoid
+    caching a name the encoder never received.
+    """
     global te
     name = get_variety_name(variety_index)
     try:
@@ -760,8 +782,10 @@ def write_variety_to_screen(variety_index: int, screen_id: int = VARIETY_NAME_SC
             VariableData(name),
         )
         print(f"Variety display s{screen_id}v{var_id}: [{variety_index}/{NUM_VARIETIES}] {name}")
+        return True
     except Exception as e:
         print(f"ERROR: writing variety name to s{screen_id}v{var_id}: {e}")
+        return False
 
 def restore_vars_if_reset():
     """
@@ -951,8 +975,13 @@ def monitor_touch_encoder_loop():
         if active_screen == ScreenID(VARIETY_NAME_SCREEN):
             sel = get_variable(VARIETY_NAME_SCREEN, 1)
             if sel is not None and sel != last_shown_index:
-                write_variety_to_screen(sel)
-                last_shown_index = sel
+                # Only cache the index once the name is actually on the screen.
+                # The te library throws an occasional "list index out of range"
+                # on string writes; caching regardless would leave the operator
+                # looking at the previous variety's name until they scrolled
+                # somewhere else and back, with nothing on screen saying so.
+                if write_variety_to_screen(sel):
+                    last_shown_index = sel
         else:
             last_shown_index = None
 
