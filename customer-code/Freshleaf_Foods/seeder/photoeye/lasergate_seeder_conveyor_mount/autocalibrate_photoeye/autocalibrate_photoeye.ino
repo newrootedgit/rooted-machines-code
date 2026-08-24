@@ -139,6 +139,18 @@ static const uint32_t CHANNEL_MIN_OFF_MS[CH_COUNT] = {
     120,  // CH_MISTING
 };
 
+// Shortest ON pulse worth producing, per channel. The floor the operator's stop
+// trim is clamped against: a pulse is dwell + (travelOff - travelOn), so a stop
+// trim more negative than the tray's own dwell would close the actuator before
+// it opened. Same physical reasoning as MIN_OFF_MS — a solenoid has a finite
+// pull-in time and the roller has to reach speed, so a pulse below this is not
+// a real dispense however the arithmetic works out.
+static const uint32_t CHANNEL_MIN_ON_MS[CH_COUNT] = {
+    120,  // CH_IRRIGATION
+    250,  // CH_HOPPER
+    120,  // CH_MISTING
+};
+
 // Sanity window for a calibration measurement, in ms. A dwell outside this
 // range is rejected as not-a-tray (hand through the beam, a jam parked in the
 // gate, sensor flicker) and calibration retries on the next tray.
@@ -197,7 +209,11 @@ struct DelayLine {
     uint8_t   tail;
     uint8_t   count;
     uint32_t  drops;      // edges lost to overflow; should stay 0
-    uint32_t  travelMs;   // gate -> this actuator, after lead compensation
+    // Gate -> actuator, after lead compensation AND the operator's trim. The
+    // two edges are held for different durations: that difference is what
+    // lengthens or shortens the pulse relative to the tray's own dwell.
+    uint32_t  travelOnMs;   // gate rising  -> actuator ON
+    uint32_t  travelOffMs;  // gate falling -> actuator OFF
     bool      headState;  // delayed gate state as seen by this actuator
 };
 
@@ -219,6 +235,21 @@ DelayLine channels[CH_COUNT];
 /////////////////////////////////////////////////////////////////////////////
 
 float user_hopper_rpm = 100;
+
+// Operator trim from the Touch Encoder, in MILLISECONDS, indexed by channel.
+// One HMI unit is TRIM_UNIT_MS, matching the refarm seeder — see the CSV parser
+// for the field mapping. These shift the autocalibrated timing rather than
+// replacing it: the geometry-and-belt-speed calculation still decides the base,
+// and these adjust it. Zero everywhere means "pure autocalibration", which is
+// what this firmware did before the trim existed.
+//
+// They are NOT validated here. Whether a given trim is physically possible
+// depends on belt speed and tray dwell, neither of which the HMI knows, so the
+// clamping happens in ComputeChannelDelays() where those are available.
+const int32_t TRIM_UNIT_MS = 100;   // one HMI unit = 100 ms
+
+int32_t user_trim_on_ms[CH_COUNT]  = { 0, 0, 0 };   // shifts the ON edge
+int32_t user_trim_off_ms[CH_COUNT] = { 0, 0, 0 };   // shifts the OFF edge
 
 // VFD conveyor speed setting (1..10) reported by the operator. Two roles here:
 //   1. Fallback shutoff timing before the first successful calibration.
@@ -264,8 +295,8 @@ float currentBeltInPerSec() {
 }
 
 // Travel time in ms from the laser gate to actuator `ch`, after subtracting
-// that channel's response-lag lead. This is the delay applied to BOTH edges of
-// the gate signal for that channel.
+// that channel's response-lag lead, and BEFORE the operator's trim. This is the
+// pure autocalibrated value: geometry divided by belt speed.
 uint32_t channelTravelMs(int ch) {
     float speed = currentBeltInPerSec();
     if (speed < 0.1f) speed = 0.1f;   // guard against a divide-by-zero table edit
@@ -279,6 +310,83 @@ uint32_t channelTravelMs(int ch) {
 
     if (travel > TRAVEL_MAX_MS) travel = TRAVEL_MAX_MS;
     return travel;
+}
+
+// How long a tray holds the beam at the current belt speed. This is "the time
+// available" that a stop trim is measured against — a pulse is the tray's dwell
+// plus whatever the trim adds or removes, so a stop trim more negative than the
+// dwell would close the actuator before it opened.
+uint32_t expectedDwellMs() {
+    float speed = currentBeltInPerSec();
+    if (speed < 0.1f) speed = 0.1f;
+    return (uint32_t)((TRAY_LENGTH_IN * 1000.0f) / speed + 0.5f);
+}
+
+// Apply the operator's trim to the autocalibrated base and clamp the result
+// into what the machine can physically do. Writes both edges for all three
+// channels; returns true if anything had to be clamped.
+//
+// WHY CLAMP RATHER THAN REJECT. An out-of-range trim cannot be caught on the
+// Touch Encoder: whether it is legal depends on belt speed and tray dwell, and
+// the HMI knows neither. Rejecting here would leave the operator with a saved
+// value that silently does nothing, which is the worst of both worlds. Railing
+// to the nearest achievable value behaves like every other physical control —
+// keep turning and you reach the stop — and the caller reports it.
+//
+// The four rules, in order. Each is applied AFTER the previous so a later rule
+// cannot reintroduce a violation of an earlier one:
+//
+//   1. No delay is negative. The earliest anything can happen is the instant
+//      the gate edge occurs; we cannot act before the tray we are reacting to.
+//   2. The sequence order is preserved: irrigation, then hopper, then misting.
+//      They sit at 2.5", 9.5" and 14" and a tray physically reaches them in
+//      that order, so timings that would fire misting before irrigation are
+//      describing something the machine cannot do.
+//   3. Every pulse stays at least CHANNEL_MIN_ON_MS long, measured against the
+//      dwell above. This is the rule that catches "trim longer than the time
+//      available".
+//   4. Nothing exceeds TRAVEL_MAX_MS.
+bool ComputeChannelDelays(uint32_t outOn[CH_COUNT], uint32_t outOff[CH_COUNT]) {
+    const int64_t dwell = (int64_t)expectedDwellMs();
+    bool clamped = false;
+
+    int64_t on[CH_COUNT], off[CH_COUNT];
+
+    for (int ch = 0; ch < CH_COUNT; ch++) {
+        const int64_t base = (int64_t)channelTravelMs(ch);
+        on[ch]  = base + (int64_t)user_trim_on_ms[ch];
+        off[ch] = base + (int64_t)user_trim_off_ms[ch];
+
+        // Rule 1 — nothing before the edge that caused it.
+        if (on[ch]  < 0) { on[ch]  = 0; clamped = true; }
+        if (off[ch] < 0) { off[ch] = 0; clamped = true; }
+    }
+
+    // Rule 2 — keep the physical sequence. Raise a later channel to its
+    // predecessor rather than lowering the earlier one, so a trim can always
+    // delay a stage but never drag the stage ahead of it backwards.
+    for (int ch = 1; ch < CH_COUNT; ch++) {
+        if (on[ch]  < on[ch - 1])  { on[ch]  = on[ch - 1];  clamped = true; }
+        if (off[ch] < off[ch - 1]) { off[ch] = off[ch - 1]; clamped = true; }
+    }
+
+    for (int ch = 0; ch < CH_COUNT; ch++) {
+        // Rule 3 — a real pulse. Length is dwell + (off - on), so the floor on
+        // off is on - dwell + minimum. Applied after rule 2 because raising an
+        // ON edge there shortens that channel's pulse.
+        const int64_t minOff = on[ch] - dwell + (int64_t)CHANNEL_MIN_ON_MS[ch];
+        if (off[ch] < minOff) { off[ch] = minOff; clamped = true; }
+        if (off[ch] < 0)      { off[ch] = 0;      clamped = true; }
+
+        // Rule 4 — absolute ceiling.
+        if (on[ch]  > (int64_t)TRAVEL_MAX_MS) { on[ch]  = TRAVEL_MAX_MS; clamped = true; }
+        if (off[ch] > (int64_t)TRAVEL_MAX_MS) { off[ch] = TRAVEL_MAX_MS; clamped = true; }
+
+        outOn[ch]  = (uint32_t)on[ch];
+        outOff[ch] = (uint32_t)off[ch];
+    }
+
+    return clamped;
 }
 
 // Variety identity — id from CSV field 1, name from CSV field 10 (last).
@@ -389,7 +497,7 @@ bool ApplyCalibration(uint32_t blockedMs) {
     Serial.print("  tray dwell:  "); Serial.print(calMeasuredBlockMs); Serial.println(" ms");
     Serial.print("  tray length: "); Serial.print(TRAY_LENGTH_IN);     Serial.println(" in");
     Serial.print("  belt speed:  "); Serial.print(calBeltInPerSec);    Serial.println(" in/s");
-    Serial.println("  channel delays (gate -> actuator, lead applied):");
+    Serial.println("  channel delays (gate -> actuator, lead applied, before trim):");
     for (int ch = 0; ch < CH_COUNT; ch++) {
         Serial.print("    ");
         Serial.print(CHANNEL_NAME[ch]);
@@ -401,6 +509,61 @@ bool ApplyCalibration(uint32_t blockedMs) {
     }
     Serial.println("=== Normal sequencing active ===");
     return true;
+}
+
+// Recompute both edges for every channel and store them on the delay lines.
+//
+// Reports only when the numbers change. This runs on every pass of the main
+// loop, so an unconditional print would bury the log; but a silent clamp would
+// repeat the mistake this whole feature exists to correct, where a control
+// appears to work and does not. Printing on change gives the operator's trim a
+// visible consequence without the noise.
+void RefreshChannelDelays() {
+    static bool     haveLast = false;
+    static uint32_t lastOn[CH_COUNT], lastOff[CH_COUNT];
+    static bool     lastClamped = false;
+
+    uint32_t on[CH_COUNT], off[CH_COUNT];
+    const bool clamped = ComputeChannelDelays(on, off);
+
+    bool changed = !haveLast || (clamped != lastClamped);
+    for (int ch = 0; ch < CH_COUNT && !changed; ch++) {
+        if (on[ch] != lastOn[ch] || off[ch] != lastOff[ch]) changed = true;
+    }
+
+    for (int ch = 0; ch < CH_COUNT; ch++) {
+        channels[ch].travelOnMs  = on[ch];
+        channels[ch].travelOffMs = off[ch];
+        lastOn[ch]  = on[ch];
+        lastOff[ch] = off[ch];
+    }
+    lastClamped = clamped;
+    haveLast    = true;
+
+    if (changed) {
+        Serial.print("Channel timing (dwell ");
+        Serial.print(expectedDwellMs());
+        Serial.println(" ms):");
+        for (int ch = 0; ch < CH_COUNT; ch++) {
+            Serial.print("  ");
+            Serial.print(CHANNEL_NAME[ch]);
+            Serial.print(": base ");
+            Serial.print(channelTravelMs(ch));
+            Serial.print(" ms, trim ");
+            Serial.print(user_trim_on_ms[ch]);
+            Serial.print("/");
+            Serial.print(user_trim_off_ms[ch]);
+            Serial.print(" ms -> on ");
+            Serial.print(on[ch]);
+            Serial.print(" ms, off ");
+            Serial.print(off[ch]);
+            Serial.println(" ms");
+        }
+        if (clamped) {
+            Serial.println("  NOTE: trim was clamped - the values above are what "
+                           "the machine can actually do, not what was asked for.");
+        }
+    }
 }
 
 //------------------------------------------------------------------------------
@@ -448,20 +611,31 @@ static void DelayLinePop(DelayLine &d) {
 // that should now be applied at that actuator.
 //
 // Short-gap suppression needs no extra hardware: an edge sits in the queue for
-// travelMs before it is due, so by the time an OFF edge matures the following ON
-// edge is usually already queued behind it. If that pair is closer together than
-// the channel's minOffMs, we consume both and stay on through the gap. (This
-// works whenever travelMs > minOffMs, which holds comfortably for all three
-// actuators at any realistic belt speed.)
+// its travel time before it is due, so by the time an OFF edge matures the
+// following ON edge is usually already queued behind it. If that pair is closer
+// together than the channel's minOffMs, we consume both and stay on through the
+// gap. (This works whenever travelOffMs > minOffMs, which holds comfortably for
+// all three actuators at any realistic belt speed and trim.)
 void DelayLineAdvance(int ch, uint32_t nowMs) {
     DelayLine     &d        = channels[ch];
-    const uint32_t travelMs = d.travelMs;
     const uint32_t minOffMs = CHANNEL_MIN_OFF_MS[ch];
 
-    while (d.count > 0 && (nowMs - d.fifo[d.head].atMs) >= travelMs) {
+    while (d.count > 0) {
 
         bool     edgeBlocked = d.fifo[d.head].blocked;
         uint32_t edgeAtMs    = d.fifo[d.head].atMs;
+
+        // Each edge waits its own delay: ON edges travelOnMs, OFF edges
+        // travelOffMs. The difference between the two is what the operator's
+        // stop trim actually changes.
+        //
+        // The queue stays strictly in order, so an OFF can never overtake the
+        // ON it belongs to even when travelOffMs is the smaller of the two — it
+        // just becomes due immediately after. That would be a zero-length
+        // pulse, which is why ComputeChannelDelays() holds the two apart by at
+        // least CHANNEL_MIN_ON_MS.
+        const uint32_t dueAfterMs = edgeBlocked ? d.travelOnMs : d.travelOffMs;
+        if ((nowMs - edgeAtMs) < dueAfterMs) break;
 
         // Peek ahead: is this a gap too short to be worth actuating?
         if (!edgeBlocked && d.count >= 2) {
@@ -493,9 +667,24 @@ void parseReceivedMessage(char *message) {
     // roller_delay,roller_duration,calibrate_request,variety_name
     //
     // NOTE: with the belt motor removed, the belt_speed field carries the VFD
-    // conveyor speed setting (1..10), and the irrigation/misting/roller delay &
-    // duration fields are not used by this firmware. We still parse all 12
-    // fields to stay aligned with the Pi's CSV framing.
+    // conveyor speed setting (1..10).
+    //
+    // Fields 4..9 are the operator's trim, in units of TRIM_UNIT_MS. They are
+    // NOT absolute times — autocalibration still derives the base timing from
+    // geometry and measured belt speed, and these shift it. The Pi names them
+    // "delay" and "duration" for historical reasons; here they are the start
+    // and stop offsets for each channel:
+    //
+    //     irrigation_delay    -> irrigation ON  shift
+    //     irrigation_duration -> irrigation OFF shift
+    //     misting_delay       -> misting    ON  shift
+    //     misting_duration    -> misting    OFF shift
+    //     roller_delay        -> hopper     ON  shift
+    //     roller_duration     -> hopper     OFF shift
+    //
+    // A positive stop shift lengthens the pulse, a negative one shortens it.
+    // All six are clamped in ComputeChannelDelays() — see there for why the
+    // validation cannot live on the HMI.
     //
     // calibrate_request was inserted BEFORE variety_name so the name stays the
     // last field — any future truncation then chops the name rather than a
@@ -514,6 +703,13 @@ void parseReceivedMessage(char *message) {
     float roller_speed_val = 0;
     char variety_name_buf[33] = "";
 
+    // Trim in HMI units, converted to ms once the whole line has parsed. Held
+    // in locals so a short or malformed line cannot leave the live trim half
+    // updated — a tray mid-flight would then be sequenced against a mixture of
+    // the old and new settings.
+    int trim_on_units[CH_COUNT]  = { 0, 0, 0 };
+    int trim_off_units[CH_COUNT] = { 0, 0, 0 };
+
     while (token != NULL && fieldIndex < 12) {
         switch (fieldIndex) {
             case 0: // ready_to_run
@@ -528,12 +724,23 @@ void parseReceivedMessage(char *message) {
             case 3: // belt_speed -> VFD speed setting (1..10)
                 vfd_speed_val = atoi(token);
                 break;
-            case 4: // irrigation_delay  (unused)
-            case 5: // irrigation_duration (unused)
-            case 6: // misting_delay (unused)
-            case 7: // misting_duration (unused)
-            case 8: // roller_delay (unused)
-            case 9: // roller_duration (unused)
+            case 4: // irrigation_delay    -> irrigation ON shift
+                trim_on_units[CH_IRRIGATION]  = atoi(token);
+                break;
+            case 5: // irrigation_duration -> irrigation OFF shift
+                trim_off_units[CH_IRRIGATION] = atoi(token);
+                break;
+            case 6: // misting_delay       -> misting ON shift
+                trim_on_units[CH_MISTING]     = atoi(token);
+                break;
+            case 7: // misting_duration    -> misting OFF shift
+                trim_off_units[CH_MISTING]    = atoi(token);
+                break;
+            case 8: // roller_delay        -> hopper ON shift
+                trim_on_units[CH_HOPPER]      = atoi(token);
+                break;
+            case 9: // roller_duration     -> hopper OFF shift
+                trim_off_units[CH_HOPPER]     = atoi(token);
                 break;
             case 10: // calibrate_request — operator pressed Calibrate on the TE
                 calibrate_request_int = atoi(token);
@@ -554,6 +761,14 @@ void parseReceivedMessage(char *message) {
     }
 
     // Map parsed values to your global variables
+
+    // Trim: units -> ms, all six at once. Only reached after the parse loop, so
+    // a truncated line leaves the previous trim intact rather than applying
+    // half of a new one.
+    for (int ch = 0; ch < CH_COUNT; ch++) {
+        user_trim_on_ms[ch]  = (int32_t)trim_on_units[ch]  * TRIM_UNIT_MS;
+        user_trim_off_ms[ch] = (int32_t)trim_off_units[ch] * TRIM_UNIT_MS;
+    }
 
     ready_to_run_flag = (ready_to_run_int != 0);
 
@@ -833,8 +1048,9 @@ void setup() {
     Serial.println("UDP telemetry initialized");
 
     for (int ch = 0; ch < CH_COUNT; ch++) {
-        channels[ch].drops    = 0;
-        channels[ch].travelMs = 0;
+        channels[ch].drops       = 0;
+        channels[ch].travelOnMs  = 0;
+        channels[ch].travelOffMs = 0;
     }
     DelayLineClearAll();
 
@@ -1023,12 +1239,10 @@ void loop() {
       } else {
           uint32_t nowMs = millis();
 
-          // Refresh each channel's travel time. Recomputed every pass so a
-          // recalibration takes effect immediately, and so edges already in
-          // flight are released on the newest speed estimate.
-          for (int ch = 0; ch < CH_COUNT; ch++) {
-              channels[ch].travelMs = channelTravelMs(ch);
-          }
+          // Refresh each channel's two travel times. Recomputed every pass so
+          // a recalibration or a trim change takes effect immediately, and so
+          // edges already in flight are released on the newest estimate.
+          RefreshChannelDelays();
 
           // Stamp every gate edge as it happens and queue it on all channels.
           if (sequenceTrigger != prevGate) {
@@ -1039,10 +1253,13 @@ void loop() {
               if (sequenceTrigger) t.traysProcessed++;
 
               DBG_PRINT(sequenceTrigger ? "Gate BLOCKED" : "Gate CLEAR");
-              DBG_PRINT(" queued; applies at irrigation/hopper/misting (ms): ");
-              DBG_PRINT(channels[CH_IRRIGATION].travelMs); DBG_PRINT("/");
-              DBG_PRINT(channels[CH_HOPPER].travelMs);     DBG_PRINT("/");
-              DBG_PRINTLN(channels[CH_MISTING].travelMs);
+              DBG_PRINT(" queued; applies at irrigation/hopper/misting (ms) on:");
+              DBG_PRINT(channels[CH_IRRIGATION].travelOnMs);  DBG_PRINT("/");
+              DBG_PRINT(channels[CH_HOPPER].travelOnMs);      DBG_PRINT("/");
+              DBG_PRINT(channels[CH_MISTING].travelOnMs);     DBG_PRINT(" off:");
+              DBG_PRINT(channels[CH_IRRIGATION].travelOffMs); DBG_PRINT("/");
+              DBG_PRINT(channels[CH_HOPPER].travelOffMs);     DBG_PRINT("/");
+              DBG_PRINTLN(channels[CH_MISTING].travelOffMs);
           }
 
           // Release whatever has aged past each channel's own travel time.
