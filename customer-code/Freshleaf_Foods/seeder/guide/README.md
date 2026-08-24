@@ -10,12 +10,16 @@ poll does not error — it silently stops working. Change both together.
 | `…_export.zip` | The flashable artifact. This is what goes on the encoder. |
 | `…_guide.zip` | The GUIDE project source. Open this to edit. |
 
-Both are as of **2026-08-19**, the revision that added the Shut Down button.
-Deployed to the CM5 at `100.119.67.117` the same day.
+Both are as of **2026-08-21**. Changes in this revision, on top of the
+2026-08-19 one that added the Shut Down button:
+
+- the six timing offsets narrowed from +-100 to **+-20** (one unit is 100 ms on
+  the ClearCore, so this is +-2 seconds)
+- roller speed maximum raised from 50 to **250**
 
 ```
-export  sha256 06cf6a514756c9645b13a7af831e70017c8b8be5646d7bf38ade830608d66e7d  (257646 bytes)
-guide   sha256 59c857fbc767fa56bbd59896bcff892472b688e59af306d187078b3d5cc8a2e0  (487122 bytes)
+export  sha256 e8e9d3e70be01daa1af287051e60df92010f83eedd435d0353852b338f63b6fc  (257630 bytes)
+guide   sha256 928644fa9e3e33c5f7df68c1bc66c1a8b2e67ebcc76d796d6c8335e8b1fb4498  (487113 bytes)
 ```
 
 The **export** hash is the one that means anything — it is the artifact that was
@@ -90,21 +94,36 @@ Screen 18 var 2 and screen 2 var 2 share an id and are unrelated.
 
 ### Value entry screens — all var 1, numeric
 
-| Screen | Field | Range |
-| --- | --- | --- |
-| 6 | Roller speed | 0 … 50 |
-| 11 | Irrigation delay | −100 … 100 |
-| 12 | Irrigation duration | −100 … 100 |
-| 13 | Misting delay | −100 … 100 |
-| 14 | Misting duration | −100 … 100 |
-| 15 | Roller delay | −100 … 100 |
-| 16 | Roller duration | −100 … 100 |
+| Screen | Field | Range | Reaches the ClearCore as |
+| --- | --- | --- | --- |
+| 6 | Roller speed | 0 … 250 | step rate = value × 30 (×10 in the sketch, ×3 gain in `HopperMoveVelocity`) |
+| 11 | Irrigation delay | −20 … 20 | irrigation ON shift, value × 100 ms |
+| 12 | Irrigation duration | −20 … 20 | irrigation OFF shift, value × 100 ms |
+| 13 | Misting delay | −20 … 20 | misting ON shift, value × 100 ms |
+| 14 | Misting duration | −20 … 20 | misting OFF shift, value × 100 ms |
+| 15 | Roller delay | −20 … 20 | hopper ON shift, value × 100 ms |
+| 16 | Roller duration | −20 … 20 | hopper OFF shift, value × 100 ms |
 
 The delay and duration fields are **offsets and legitimately go negative**. A
 GUIDE widget limited to 0 and above silently destroys half of every operator's
-range. Confirm the widget limits match the `variable_ranges` block in
-`TE_Variable_Values.json` — poll validates against the file, not against its own
-defaults.
+range.
+
+They are **trim on top of autocalibration**, not absolute times: the firmware
+derives each actuator's base timing from geometry ÷ measured belt speed, and
+these shift it. The firmware clamps them — see `ComputeChannelDelays()` in
+`autocalibrate_photoeye.ino` — because whether a given trim is achievable
+depends on belt speed and tray dwell, which the HMI does not know.
+
+**±20 rather than ±100 is deliberate.** At ±100 the extremes were −10 s against
+a tray dwell of about 5 s, so the firmware clamped them away entirely and three
+quarters of the dial did nothing.
+
+Three places must agree on these limits and nothing enforces it automatically:
+the widget in this project, `DEFAULT_VARIABLE_RANGES` in
+`tabletop_seeder_poll.py`, and the `variable_ranges` block in the live
+`TE_Variable_Values.json` (use `retune-variable-ranges.py` for that last one —
+it edits in place instead of re-seeding over the operator's presets). Poll
+validates saves against the FILE, not against its own defaults.
 
 `belt_speed` has a declared range but **no screen** — the conveyor runs off its
 own control, not the encoder.

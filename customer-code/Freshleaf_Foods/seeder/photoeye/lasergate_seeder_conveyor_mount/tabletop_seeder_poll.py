@@ -26,15 +26,30 @@ NUM_VARIETIES = 20       # total variety slots (1-20)
 #
 # Note the delay/duration fields legitimately go NEGATIVE: they are offsets, not
 # elapsed times. Any "nothing can be negative" rule would reject valid presets.
+#
+# The six offsets are +-20, not +-100. The ClearCore multiplies them by 100 to
+# get milliseconds, so one unit is 100 ms and this range is +-2 seconds. At the
+# +-100 these used to carry, most of the dial was dead travel: a -100 is -10 s
+# against a tray dwell of about 5 s, so the firmware clamped it away entirely
+# and the operator got no feedback for the last three quarters of the range.
+# Same value and same reasoning as the refarm seeder.
+#
+# These MUST agree with the widget limits in the GUIDE project. Poll validates
+# saves against the settings file, so a range wider here than on the HMI is
+# harmless, but narrower means refusing presets the operator can legitimately
+# enter.
+# roller_speed is 0-250, matching the GUIDE widget. The sketch multiplies it by
+# 10 and HopperMoveVelocity applies a further gain of 3, so the value here times
+# 30 is the step rate commanded to the roller motor: 250 -> 7500 pulses/sec.
 DEFAULT_VARIABLE_RANGES = {
-    "roller_speed":        {"min": 0,    "max": 50},
-    "belt_speed":          {"min": 0,    "max": 10},
-    "irrigation_delay":    {"min": -100, "max": 100},
-    "irrigation_duration": {"min": -100, "max": 100},
-    "misting_delay":       {"min": -100, "max": 100},
-    "misting_duration":    {"min": -100, "max": 100},
-    "roller_delay":        {"min": -100, "max": 100},
-    "roller_duration":     {"min": -100, "max": 100},
+    "roller_speed":        {"min": 0,   "max": 250},
+    "belt_speed":          {"min": 0,   "max": 10},
+    "irrigation_delay":    {"min": -20, "max": 20},
+    "irrigation_duration": {"min": -20, "max": 20},
+    "misting_delay":       {"min": -20, "max": 20},
+    "misting_duration":    {"min": -20, "max": 20},
+    "roller_delay":        {"min": -20, "max": 20},
+    "roller_duration":     {"min": -20, "max": 20},
 }
 
 # Variety name display on Touch Encoder
