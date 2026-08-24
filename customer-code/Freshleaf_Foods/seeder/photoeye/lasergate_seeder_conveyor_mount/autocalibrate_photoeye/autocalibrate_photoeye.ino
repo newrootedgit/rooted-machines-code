@@ -158,6 +158,35 @@ static const uint32_t CHANNEL_MIN_ON_MS[CH_COUNT] = {
     120,  // CH_MISTING
 };
 
+// Why an edge ended up somewhere other than base + trim. Recorded per edge so
+// the operator is told which control was overruled and by which rule, instead
+// of a blanket "something was clamped" covering all six numbers at once.
+//
+// The rules are applied in order and a later one can move an edge an earlier
+// one already moved, so this records the LAST rule to change it — the one
+// actually holding the value where it is.
+//
+// These live up here with the other type definitions rather than next to
+// ComputeChannelDelays() where they are used, and they have to: the Arduino
+// build generates prototypes for every function and inserts them above the
+// first function definition in the file. A type named in a signature must be
+// declared before that point or the generated prototype will not compile.
+enum ClampReason {
+    CLAMP_NONE = 0,
+    CLAMP_NEGATIVE,   // rule 1
+    CLAMP_ORDER,      // rule 2
+    CLAMP_MIN_ON,     // rule 3
+    CLAMP_CEILING,    // rule 4
+};
+
+// What was asked for on one channel, and what became of it.
+struct ChannelClamp {
+    int32_t askedOn;    // base + trim, before any rule ran
+    int32_t askedOff;
+    uint8_t reasonOn;   // ClampReason
+    uint8_t reasonOff;
+};
+
 // Sanity window for a calibration measurement, in ms. A dwell outside this
 // range is rejected as not-a-tray (hand through the beam, a jam parked in the
 // gate, sensor flicker) and calibration retries on the next tray.
@@ -329,9 +358,20 @@ uint32_t expectedDwellMs() {
     return (uint32_t)((TRAY_LENGTH_IN * 1000.0f) / speed + 0.5f);
 }
 
+const char *ClampReasonText(uint8_t reason) {
+    switch (reason) {
+        case CLAMP_NEGATIVE: return "cannot act before the gate edge that triggered it";
+        case CLAMP_ORDER:    return "would fire out of physical sequence";
+        case CLAMP_MIN_ON:   return "pulse shorter than this channel's minimum";
+        case CLAMP_CEILING:  return "beyond the travel-time ceiling";
+        default:             return "";
+    }
+}
+
 // Apply the operator's trim to the autocalibrated base and clamp the result
 // into what the machine can physically do. Writes both edges for all three
-// channels; returns true if anything had to be clamped.
+// channels, fills outClamp with what each edge asked for and which rule (if
+// any) overruled it, and returns true if anything was clamped at all.
 //
 // WHY CLAMP RATHER THAN REJECT. An out-of-range trim cannot be caught on the
 // Touch Encoder: whether it is legal depends on belt speed and tray dwell, and
@@ -353,7 +393,8 @@ uint32_t expectedDwellMs() {
 //      dwell above. This is the rule that catches "trim longer than the time
 //      available".
 //   4. Nothing exceeds TRAVEL_MAX_MS.
-bool ComputeChannelDelays(uint32_t outOn[CH_COUNT], uint32_t outOff[CH_COUNT]) {
+bool ComputeChannelDelays(uint32_t outOn[CH_COUNT], uint32_t outOff[CH_COUNT],
+                          ChannelClamp outClamp[CH_COUNT]) {
     const int64_t dwell = (int64_t)expectedDwellMs();
     bool clamped = false;
 
@@ -364,17 +405,24 @@ bool ComputeChannelDelays(uint32_t outOn[CH_COUNT], uint32_t outOff[CH_COUNT]) {
         on[ch]  = base + (int64_t)user_trim_on_ms[ch];
         off[ch] = base + (int64_t)user_trim_off_ms[ch];
 
+        // Record the request before any rule touches it — this is what the
+        // operator dialled in, and what the report compares against.
+        outClamp[ch].askedOn   = (int32_t)on[ch];
+        outClamp[ch].askedOff  = (int32_t)off[ch];
+        outClamp[ch].reasonOn  = CLAMP_NONE;
+        outClamp[ch].reasonOff = CLAMP_NONE;
+
         // Rule 1 — nothing before the edge that caused it.
-        if (on[ch]  < 0) { on[ch]  = 0; clamped = true; }
-        if (off[ch] < 0) { off[ch] = 0; clamped = true; }
+        if (on[ch]  < 0) { on[ch]  = 0; outClamp[ch].reasonOn  = CLAMP_NEGATIVE; clamped = true; }
+        if (off[ch] < 0) { off[ch] = 0; outClamp[ch].reasonOff = CLAMP_NEGATIVE; clamped = true; }
     }
 
     // Rule 2 — keep the physical sequence. Raise a later channel to its
     // predecessor rather than lowering the earlier one, so a trim can always
     // delay a stage but never drag the stage ahead of it backwards.
     for (int ch = 1; ch < CH_COUNT; ch++) {
-        if (on[ch]  < on[ch - 1])  { on[ch]  = on[ch - 1];  clamped = true; }
-        if (off[ch] < off[ch - 1]) { off[ch] = off[ch - 1]; clamped = true; }
+        if (on[ch]  < on[ch - 1])  { on[ch]  = on[ch - 1];  outClamp[ch].reasonOn  = CLAMP_ORDER; clamped = true; }
+        if (off[ch] < off[ch - 1]) { off[ch] = off[ch - 1]; outClamp[ch].reasonOff = CLAMP_ORDER; clamped = true; }
     }
 
     for (int ch = 0; ch < CH_COUNT; ch++) {
@@ -382,12 +430,12 @@ bool ComputeChannelDelays(uint32_t outOn[CH_COUNT], uint32_t outOff[CH_COUNT]) {
         // off is on - dwell + minimum. Applied after rule 2 because raising an
         // ON edge there shortens that channel's pulse.
         const int64_t minOff = on[ch] - dwell + (int64_t)CHANNEL_MIN_ON_MS[ch];
-        if (off[ch] < minOff) { off[ch] = minOff; clamped = true; }
-        if (off[ch] < 0)      { off[ch] = 0;      clamped = true; }
+        if (off[ch] < minOff) { off[ch] = minOff; outClamp[ch].reasonOff = CLAMP_MIN_ON;  clamped = true; }
+        if (off[ch] < 0)      { off[ch] = 0;      outClamp[ch].reasonOff = CLAMP_NEGATIVE; clamped = true; }
 
         // Rule 4 — absolute ceiling.
-        if (on[ch]  > (int64_t)TRAVEL_MAX_MS) { on[ch]  = TRAVEL_MAX_MS; clamped = true; }
-        if (off[ch] > (int64_t)TRAVEL_MAX_MS) { off[ch] = TRAVEL_MAX_MS; clamped = true; }
+        if (on[ch]  > (int64_t)TRAVEL_MAX_MS) { on[ch]  = TRAVEL_MAX_MS; outClamp[ch].reasonOn  = CLAMP_CEILING; clamped = true; }
+        if (off[ch] > (int64_t)TRAVEL_MAX_MS) { off[ch] = TRAVEL_MAX_MS; outClamp[ch].reasonOff = CLAMP_CEILING; clamped = true; }
 
         outOn[ch]  = (uint32_t)on[ch];
         outOff[ch] = (uint32_t)off[ch];
@@ -529,20 +577,30 @@ void RefreshChannelDelays() {
     static bool     haveLast = false;
     static uint32_t lastOn[CH_COUNT], lastOff[CH_COUNT];
     static bool     lastClamped = false;
+    static uint8_t  lastReasonOn[CH_COUNT]  = { CLAMP_NONE, CLAMP_NONE, CLAMP_NONE };
+    static uint8_t  lastReasonOff[CH_COUNT] = { CLAMP_NONE, CLAMP_NONE, CLAMP_NONE };
 
-    uint32_t on[CH_COUNT], off[CH_COUNT];
-    const bool clamped = ComputeChannelDelays(on, off);
+    uint32_t     on[CH_COUNT], off[CH_COUNT];
+    ChannelClamp clamp[CH_COUNT];
+    const bool   clamped = ComputeChannelDelays(on, off, clamp);
 
     bool changed = !haveLast || (clamped != lastClamped);
     for (int ch = 0; ch < CH_COUNT && !changed; ch++) {
         if (on[ch] != lastOn[ch] || off[ch] != lastOff[ch]) changed = true;
+        // Re-report if the REASON changed even when the resulting number did
+        // not: the same clamped value arrived at by a different rule is a
+        // different thing to tell the operator.
+        if (clamp[ch].reasonOn  != lastReasonOn[ch])  changed = true;
+        if (clamp[ch].reasonOff != lastReasonOff[ch]) changed = true;
     }
 
     for (int ch = 0; ch < CH_COUNT; ch++) {
         channels[ch].travelOnMs  = on[ch];
         channels[ch].travelOffMs = off[ch];
-        lastOn[ch]  = on[ch];
-        lastOff[ch] = off[ch];
+        lastOn[ch]        = on[ch];
+        lastOff[ch]       = off[ch];
+        lastReasonOn[ch]  = clamp[ch].reasonOn;
+        lastReasonOff[ch] = clamp[ch].reasonOff;
     }
     lastClamped = clamped;
     haveLast    = true;
@@ -566,9 +624,32 @@ void RefreshChannelDelays() {
             Serial.print(off[ch]);
             Serial.println(" ms");
         }
+        // Name every edge that was overruled, with the number asked for, the
+        // number now in force, and the rule responsible.
+        //
+        // This replaced a single blanket NOTE covering the whole set. That made
+        // a 2 ms rail — irrigation asking for -2 ms and getting 0 — read
+        // identically to a trim thrown away wholesale, and it implied all six
+        // numbers above were suspect when five of them were exactly as asked.
+        // A warning that fires on something harmless is one the operator learns
+        // to ignore, which costs us the real ones.
         if (clamped) {
-            Serial.println("  NOTE: trim was clamped - the values above are what "
-                           "the machine can actually do, not what was asked for.");
+            for (int ch = 0; ch < CH_COUNT; ch++) {
+                if (clamp[ch].reasonOn != CLAMP_NONE) {
+                    Serial.print("  CLAMPED ");   Serial.print(CHANNEL_NAME[ch]);
+                    Serial.print(" ON: asked ");  Serial.print(clamp[ch].askedOn);
+                    Serial.print(" ms -> ");      Serial.print(on[ch]);
+                    Serial.print(" ms (");        Serial.print(ClampReasonText(clamp[ch].reasonOn));
+                    Serial.println(")");
+                }
+                if (clamp[ch].reasonOff != CLAMP_NONE) {
+                    Serial.print("  CLAMPED ");   Serial.print(CHANNEL_NAME[ch]);
+                    Serial.print(" OFF: asked "); Serial.print(clamp[ch].askedOff);
+                    Serial.print(" ms -> ");      Serial.print(off[ch]);
+                    Serial.print(" ms (");        Serial.print(ClampReasonText(clamp[ch].reasonOff));
+                    Serial.println(")");
+                }
+            }
         }
     }
 }
