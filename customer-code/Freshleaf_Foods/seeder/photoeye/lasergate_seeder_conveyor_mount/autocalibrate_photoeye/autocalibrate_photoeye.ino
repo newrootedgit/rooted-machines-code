@@ -983,6 +983,59 @@ void HandleAlerts() {
 // inbound command reads.
 //------------------------------------------------------------------------------
 
+// Single UDP send path for every frame this controller emits.
+//
+// WHY THE FAILURE COUNT DRIVES RECOVERY. MaintainEthernetLink() rebuilds the
+// stack on the rising edge of linkStatus(), which is fine when that call is
+// telling the truth. On 2026-08-24 it was not: TCP worked, ARP answered, and
+// tcpdump on the Pi saw zero UDP for hours. linkStatus() never reported LinkON
+// again after the link cycled, so the edge never came and Udp.begin() was never
+// re-run — the socket stayed dead with nothing to notice.
+//
+// So recovery here keys on the symptom instead of the flag. Consecutive
+// endPacket() failures mean the socket is not delivering, whatever any status
+// call claims, and rebuilding is the only thing that has been observed to fix
+// it. A single failure is ignored: one dropped datagram is normal on a link
+// that is genuinely busy and not worth tearing the stack down for.
+static uint32_t udpConsecutiveFails = 0;
+
+// Three at one send per second: react in a few seconds, never on a blip.
+static const uint32_t UDP_FAIL_REBUILD_THRESHOLD = 3;
+
+// Do not rebuild more than this often. A rebuild that does not help must not
+// turn into a loop that starves the control loop of time.
+static const uint32_t UDP_REBUILD_MIN_INTERVAL_MS = 5000;
+
+void RebuildNetworkStack(const char *reason);
+
+bool UdpSend(uint16_t port, const char *payload) {
+    Udp.beginPacket(serverIp, port);
+    Udp.write((const uint8_t *)payload, strlen(payload));
+
+    if (Udp.endPacket()) {
+        if (udpConsecutiveFails > 0) {
+            Serial.print("UDP delivering again after ");
+            Serial.print(udpConsecutiveFails);
+            Serial.println(" consecutive failures.");
+        }
+        udpConsecutiveFails = 0;
+        return true;
+    }
+
+    t.udpSendFailCount++;
+    udpConsecutiveFails++;
+
+    if (udpConsecutiveFails >= UDP_FAIL_REBUILD_THRESHOLD) {
+        static uint32_t lastRebuildMs = 0;
+        uint32_t now = millis();
+        if (lastRebuildMs == 0 || (now - lastRebuildMs) >= UDP_REBUILD_MIN_INTERVAL_MS) {
+            lastRebuildMs = now;
+            RebuildNetworkStack("UDP sends failing");
+        }
+    }
+    return false;
+}
+
 // NOTE ON THE MISSING LINK CHECK.
 //
 // All three UDP senders used to open with `if (Ethernet.linkStatus() != LinkON)
@@ -1045,11 +1098,7 @@ void SendStatusUpdate() {
              activeVarietyId,
              activeVarietyName);
 
-    Udp.beginPacket(serverIp, remotePort);
-    Udp.write((const uint8_t *)telemetryBuffer, strlen(telemetryBuffer));
-    if (!Udp.endPacket()) {
-        t.udpSendFailCount++;
-    }
+    UdpSend(remotePort, telemetryBuffer);
 }
 
 // Calibration state ping for the Pi's control plane. Separate from
@@ -1087,11 +1136,7 @@ void SendCalState() {
              (unsigned long)channelTravelMs(CH_HOPPER),
              (unsigned long)channelTravelMs(CH_MISTING));
 
-    Udp.beginPacket(serverIp, calStatePort);
-    Udp.write((const uint8_t *)buf, strlen(buf));
-    if (!Udp.endPacket()) {
-        t.udpSendFailCount++;
-    }
+    UdpSend(calStatePort, buf);
 }
 
 // Lightweight fault ping — emit once on the fault edge (0->1), not every
@@ -1115,11 +1160,7 @@ void SendEvent(const char *eventCode, const char *motor) {
              1,
              motor);
 
-    Udp.beginPacket(serverIp, remotePort);
-    Udp.write((const uint8_t *)telemetryBuffer, strlen(telemetryBuffer));
-    if (!Udp.endPacket()) {
-        t.udpSendFailCount++;
-    }
+    UdpSend(remotePort, telemetryBuffer);
 }
 
 void setup() {
@@ -1214,6 +1255,22 @@ void setup() {
     ResetCalibration("boot");
 }
 
+// Tear the IP stack down and bring it back up.
+//
+// Udp.begin() has to be repeated: that socket does not survive the netif going
+// down. client.stop() drops the TCP side so the reconnect path in loop() builds
+// a fresh socket rather than nursing a dead one it still believes is open.
+void RebuildNetworkStack(const char *reason) {
+    Serial.print("Rebuilding the IP stack (");
+    Serial.print(reason);
+    Serial.println(").");
+    client.stop();
+    Ethernet.begin(mac, ip);
+    Udp.begin(UDP_LOCAL_PORT);
+    udpConsecutiveFails = 0;   // give the new socket a clean slate to prove itself
+    Serial.println("IP stack rebuilt; reconnecting to the server.");
+}
+
 // Bring the IP stack back after the physical link has been away.
 //
 // WHY THIS EXISTS. Ethernet.begin() used to run exactly once, in setup(). The
@@ -1238,11 +1295,7 @@ void MaintainEthernetLink() {
     const bool linkUp = (Ethernet.linkStatus() == LinkON);
 
     if (linkUp && !lastLinkUp) {
-        Serial.println("Ethernet link restored — reinitialising the IP stack.");
-        client.stop();
-        Ethernet.begin(mac, ip);
-        Udp.begin(UDP_LOCAL_PORT);
-        Serial.println("IP stack reinitialised; reconnecting to the server.");
+        RebuildNetworkStack("Ethernet link restored");
     } else if (!linkUp && lastLinkUp) {
         Serial.println("Ethernet link lost — the Pi is probably powered down. "
                        "Sequencing continues; telemetry resumes when it returns.");

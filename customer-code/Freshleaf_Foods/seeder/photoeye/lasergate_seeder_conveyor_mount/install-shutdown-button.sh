@@ -111,6 +111,23 @@ REQUEST="/run/rooted/shutdown-request"
 
 echo "shutdown: request received — $(cat "$REQUEST" 2>/dev/null || echo 'no detail')"
 
+# Time each step. Operators report the halt taking anywhere from 5 seconds to
+# over a minute, which reads as a crash rather than a shutdown. Nothing shows a
+# stalled stop job, so the variable cost is most likely here — the journal and
+# the page cache both grow with uptime, so the same button costs seconds after a
+# reboot and much longer at the end of a shift. These lines say which step it
+# was; read them from the PREVIOUS boot after a slow one:
+#
+#     journalctl -u rooted-shutdown.service -b -1 --no-pager
+step_start=$(date +%s%N)
+step() {
+    local now elapsed
+    now=$(date +%s%N)
+    elapsed=$(( (now - step_start) / 1000000 ))
+    echo "shutdown: $1 took ${elapsed} ms"
+    step_start=$now
+}
+
 # Remove it before halting, not after. If the halt is interrupted the request
 # must not still be sitting there, or the machine would try to shut down again
 # the moment the .path unit starts on the next boot.
@@ -120,11 +137,13 @@ rm -f "$REQUEST"
 # recorded. Without this, the log of the clean shutdown is the first casualty
 # of the clean shutdown.
 journalctl --flush || true
+step "journal flush"
 
 # Belt and braces: systemd unmounts cleanly on poweroff, but poll wrote
 # ready_to_run=false moments ago and that write should be on the card before
 # anything else happens.
 sync
+step "sync"
 
 echo "shutdown: halting now — safe to unplug once the encoder screen goes dark"
 systemctl poweroff
@@ -138,6 +157,42 @@ else
     note "already installed, unchanged"
 fi
 rm -f /tmp/.rooted-shutdown
+
+# ---------------------------------------------------------------------------
+# 2b. Bound how long any single unit may delay the halt
+# ---------------------------------------------------------------------------
+say "Capping the per-unit stop timeout"
+
+# systemd's default is 90 seconds per unit. One service declining to exit is
+# therefore a minute and a half of an operator watching a screen that says
+# "Shutting down" and wondering whether the machine has crashed — and the honest
+# answer is that they cannot tell, which is the whole problem.
+#
+# Ten seconds is generous for everything on this machine: poll and the TCP
+# server exit on SIGTERM immediately, and the only state that must reach the
+# card is a 6 KB JSON that was already fsynced when it was written. A unit that
+# has not stopped in ten seconds is not going to, and SIGKILL is the correct
+# answer for an appliance whose next action is losing power anyway.
+#
+# This is deliberately system-wide rather than per-unit: the units that delay a
+# shutdown are usually not the ones anybody thought to configure.
+install -d -m 755 /etc/systemd/system.conf.d
+cat > /tmp/.rooted-timeout.conf <<'TIMEOUT'
+# Installed by install-shutdown-button.sh — see that script for the reasoning.
+[Manager]
+DefaultTimeoutStopSec=10s
+TIMEOUT
+
+if ! cmp -s /tmp/.rooted-timeout.conf /etc/systemd/system.conf.d/rooted-shutdown-timeout.conf 2>/dev/null; then
+    install -o root -g root -m 644 /tmp/.rooted-timeout.conf         /etc/systemd/system.conf.d/rooted-shutdown-timeout.conf
+    note "installed /etc/systemd/system.conf.d/rooted-shutdown-timeout.conf"
+    warn "this takes effect after the NEXT reboot — systemd cannot reload"
+    warn "manager configuration without one."
+    CHANGED=1
+else
+    note "already installed, unchanged"
+fi
+rm -f /tmp/.rooted-timeout.conf
 
 # ---------------------------------------------------------------------------
 # 3. The watcher
