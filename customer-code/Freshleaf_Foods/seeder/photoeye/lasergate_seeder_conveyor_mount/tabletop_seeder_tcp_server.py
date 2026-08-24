@@ -57,6 +57,13 @@ BELT_SPEED_CSV_VALUE = 1
 # file for three lines of parsing.
 CAL_STATE_UDP_HOST = "0.0.0.0"
 CAL_STATE_UDP_PORT = 9997
+
+# cal_state values as the sketch reports them. Must match the CalState enum in
+# autocalibrate_photoeye.ino and the constants in tabletop_seeder_poll.py.
+# Only DONE is used here — the belt speed is persisted from that state alone.
+CAL_STATE_WAITING   = 0
+CAL_STATE_MEASURING = 1
+CAL_STATE_DONE      = 2
 CAL_STATE_SCHEMA_VER = 1
 
 # If no CAL_STATE datagram arrives for this long, treat the calibration state as
@@ -352,8 +359,16 @@ def cal_state_listener() -> None:
     sock.settimeout(1.0)
     print(f"tcp: cal_state listener on {CAL_STATE_UDP_HOST}:{CAL_STATE_UDP_PORT}")
 
-    last_rx = 0.0
-    last_written = None
+    # Sentinel distinct from None, because None is a real cal_state value here
+    # meaning "no link". Starting at this sentinel lets the staleness check fire
+    # ONCE even though no datagram has ever arrived — see below for why that
+    # matters more than it sounds.
+    NEVER_WRITTEN = object()
+
+    # Start the clock now rather than at zero, so the controller gets the full
+    # staleness window to announce itself before we declare the link dead.
+    last_rx = time.monotonic()
+    last_written = NEVER_WRITTEN
     last_speed_written = None
     while True:
         try:
@@ -361,6 +376,15 @@ def cal_state_listener() -> None:
         except socket.timeout:
             # No datagram this second. If the controller has gone quiet, drop
             # the state to unknown so the TE stops claiming a stale result.
+            #
+            # This has to fire when NOTHING has ever been received, not just
+            # after a controller that was talking goes silent. cal_state is
+            # persisted in the JSON, so a machine that calibrated last week and
+            # comes up with the ClearCore unplugged would otherwise keep
+            # reporting "Calibrated" indefinitely — inviting the operator to run
+            # a machine whose timing was never measured, with no controller
+            # attached at all. The sentinel above is what lets the first pass
+            # through here clear it; `is not None` then stops it repeating.
             if last_written is not None and (time.monotonic() - last_rx) > CAL_STATE_STALE_AFTER_S:
                 try:
                     _locked_merge_json({"cal_state": None})
