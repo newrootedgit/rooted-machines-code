@@ -26,8 +26,8 @@
 //     travel_ms_i = CHANNEL_DISTANCE_IN[i] * 1000 / belt_in_per_sec
 //
 // Each actuator then replays the gate signal delayed by its own travel_ms, so
-// irrigation (2.5"), the seed hopper (9.5") and misting (14") switch on and off
-// in sequence as each tray edge reaches them.
+// irrigation (2.57"), the seed hopper (8.38") and misting (13.66") switch on and
+// off in sequence as each tray edge reaches them.
 // ============================================================================
 
 // No belt motor on this machine. The conveyor is driven by a separate VFD with
@@ -92,9 +92,9 @@ static const float TRAY_LENGTH_IN = 20.0f;
 // Each actuator sits a different distance downstream of the main laser gate, so
 // each one gets its own delay. Measured along the belt from the IO1 beam:
 //
-//     irrigation bar   2.5 in
-//     seed hopper      9.5 in
-//     misting bar     14.0 in
+//     irrigation bar    2.566885 in
+//     seed hopper       8.383860 in
+//     misting bar      13.656300 in
 //
 // A tray's leading edge reaches each actuator at gate_time + distance/speed,
 // and its trailing edge likewise. Each channel therefore replays the gate
@@ -113,10 +113,17 @@ static const char * const CHANNEL_NAME[CH_COUNT] = {
 };
 
 // Distance from the IO1 beam to each actuator, in inches along the belt.
+//
+// Taken from the CAD model of the conveyor mount, superseding the tape-measure
+// figures (2.5 / 9.5 / 14.0) these replace. The hopper moved the most — 1.116 in
+// closer to the gate — so any trim tuned against the old number is now roughly
+// 130 ms early at 8.4 in/s. Re-tune from zero trim rather than adjusting the
+// old values, since it is no longer clear which part of a tuned trim was
+// covering the geometry error.
 static const float CHANNEL_DISTANCE_IN[CH_COUNT] = {
-    2.5f,   // CH_IRRIGATION
-    9.5f,   // CH_HOPPER
-    14.0f,  // CH_MISTING
+    2.566885f,   // CH_IRRIGATION
+    8.383860f,   // CH_HOPPER
+    13.656300f,  // CH_MISTING
 };
 
 // Per-channel fixed lead (ms) subtracted from the computed travel time, to
@@ -159,7 +166,7 @@ static const uint32_t CAL_MAX_BLOCK_MS = 15000;
 
 // Absolute clamp on any derived travel time, in ms. Belt-and-suspenders in case
 // the geometry constants are edited to something nonsensical. There is no lower
-// clamp: the irrigation bar at 2.5" on a fast belt legitimately lands near zero.
+// clamp: the irrigation bar at 2.57" on a fast belt legitimately lands near zero.
 static const uint32_t TRAVEL_MAX_MS = 30000;
 
 enum CalState {
@@ -339,8 +346,8 @@ uint32_t expectedDwellMs() {
 //   1. No delay is negative. The earliest anything can happen is the instant
 //      the gate edge occurs; we cannot act before the tray we are reacting to.
 //   2. The sequence order is preserved: irrigation, then hopper, then misting.
-//      They sit at 2.5", 9.5" and 14" and a tray physically reaches them in
-//      that order, so timings that would fire misting before irrigation are
+//      They sit at 2.57", 8.38" and 13.66" and a tray physically reaches them
+//      in that order, so timings that would fire misting before irrigation are
 //      describing something the machine cannot do.
 //   3. Every pulse stays at least CHANNEL_MIN_ON_MS long, measured against the
 //      dwell above. This is the rule that catches "trim longer than the time
