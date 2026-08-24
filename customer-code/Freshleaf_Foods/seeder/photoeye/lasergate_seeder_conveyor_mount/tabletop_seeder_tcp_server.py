@@ -162,6 +162,16 @@ def load_state() -> Dict:
         variety_name.replace(",", "_").replace("\n", "_").replace("\r", "_")[:32]
     )
 
+    # Machine-level, not per-variety: one conveyor, one measured speed. Absent
+    # or unparseable reads as 0, which the sketch treats as "never calibrated"
+    # and ignores, falling back to measuring a tray as it always did.
+    try:
+        calibrated_belt_speed_x100 = int(data.get("calibrated_belt_speed_x100", 0))
+    except (TypeError, ValueError):
+        calibrated_belt_speed_x100 = 0
+    if calibrated_belt_speed_x100 < 0:
+        calibrated_belt_speed_x100 = 0
+
     return {
         "ready_to_run": ready_to_run,
         "active_variety": int(active_variety),
@@ -174,6 +184,12 @@ def load_state() -> Dict:
         "roller_delay": variety_values["roller_delay"],
         "roller_duration": variety_values["roller_duration"],
         "calibrate_request": calibrate_request,
+        # Last measured conveyor speed, hundredths of an inch/sec, 0 = never
+        # calibrated. Sent back down so a ClearCore that has just booted can
+        # resume from the last measurement instead of burning a tray to
+        # re-measure something that has not changed. The controller decides
+        # whether to use it; see the restore guard in the sketch.
+        "calibrated_belt_speed_x100": calibrated_belt_speed_x100,
         "variety_name": variety_name,
     }
 
@@ -207,8 +223,12 @@ def build_payload() -> str:
     state = load_state()
     # Field order is the contract with the ClearCore parser. variety_name is
     # last so any future overflow truncation chops the name, not the structured
-    # numeric tail — which is why calibrate_request slots in ahead of it rather
-    # than being appended.
+    # numeric tail — which is why calibrate_request and calibrated_belt_speed_x100
+    # slot in ahead of it rather than being appended.
+    #
+    # 13 fields. Changing this list means changing parseReceivedMessage() in
+    # autocalibrate_photoeye.ino in the same breath — it parses by position, so
+    # a field added on one side only silently shifts every field after it.
     payload_fields = [
         state["ready_to_run"],
         state["active_variety"],
@@ -221,6 +241,7 @@ def build_payload() -> str:
         state["roller_delay"],
         state["roller_duration"],
         state["calibrate_request"],
+        state["calibrated_belt_speed_x100"],
         state["variety_name"],
     ]
     return ",".join(str(x) for x in payload_fields)
@@ -270,13 +291,19 @@ def _locked_merge_json(updates: Dict) -> None:
                     pass
 
 
-def parse_cal_state(raw: str) -> int | None:
+def parse_cal_state(raw: str) -> tuple[int, int | None] | None:
     """
-    Pull cal_state out of a CAL_STATE datagram.
+    Pull cal_state and the measured belt speed out of a CAL_STATE datagram.
 
     Format: CAL_STATE,schema_ver,boot_id,seq,cal_state,belt_speed_x100
-    Returns None for anything malformed or off-schema — a bad datagram must
-    never be able to move the displayed state.
+    Returns (cal_state, belt_speed_x100) or None for anything malformed or
+    off-schema — a bad datagram must never be able to move the displayed state.
+
+    belt_speed_x100 is hundredths of an inch/sec, and comes back None when the
+    field is absent or unparseable. It was previously read off the wire and
+    dropped on the floor; it is the only measurement of the conveyor this system
+    ever makes, and the ClearCore has no persistent storage to keep it in, so
+    the Pi is the only place it can survive a power cycle.
     """
     parts = raw.strip().split(",")
     if len(parts) < 5 or parts[0].strip() != "CAL_STATE":
@@ -287,7 +314,22 @@ def parse_cal_state(raw: str) -> int | None:
         cal_state = int(parts[4])
     except ValueError:
         return None
-    return cal_state if cal_state in (0, 1, 2) else None
+    if cal_state not in (0, 1, 2):
+        return None
+
+    belt_speed_x100 = None
+    if len(parts) >= 6:
+        try:
+            v = int(parts[5])
+            # Reject nonsense rather than persisting it. Zero means "not
+            # measured"; the upper bound is far above any real conveyor and
+            # exists only to stop a garbled field becoming a stored setting.
+            if 0 < v <= 100_000:
+                belt_speed_x100 = v
+        except ValueError:
+            pass
+
+    return (cal_state, belt_speed_x100)
 
 
 def cal_state_listener() -> None:
@@ -312,6 +354,7 @@ def cal_state_listener() -> None:
 
     last_rx = 0.0
     last_written = None
+    last_speed_written = None
     while True:
         try:
             raw, _addr = sock.recvfrom(256)
@@ -331,11 +374,33 @@ def cal_state_listener() -> None:
             time.sleep(0.5)
             continue
 
-        cal_state = parse_cal_state(raw.decode("utf-8", errors="replace"))
-        if cal_state is None:
+        parsed = parse_cal_state(raw.decode("utf-8", errors="replace"))
+        if parsed is None:
             continue
+        cal_state, belt_speed_x100 = parsed
 
         last_rx = time.monotonic()
+
+        # Persist the measured speed so it survives a ClearCore power cycle.
+        #
+        # Only from a DONE state: while the controller is WAITING or MEASURING
+        # the field carries the pre-calibration fallback, and storing that would
+        # replace a real measurement with a table lookup.
+        #
+        # Only on change, and this matters: these datagrams arrive once a second
+        # forever. Writing every one would put a continuous write load on the SD
+        # card for a value that changes when a tray is calibrated and at no other
+        # time.
+        if cal_state == CAL_STATE_DONE and belt_speed_x100 is not None:
+            if belt_speed_x100 != last_speed_written:
+                try:
+                    _locked_merge_json({"calibrated_belt_speed_x100": belt_speed_x100})
+                    print(f"tcp: stored calibrated belt speed "
+                          f"{belt_speed_x100 / 100.0:.2f} in/s")
+                    last_speed_written = belt_speed_x100
+                except OSError as e:
+                    print(f"tcp: could not store calibrated belt speed: {e}")
+
         if cal_state != last_written:
             try:
                 _locked_merge_json({"cal_state": cal_state})
