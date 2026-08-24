@@ -983,10 +983,22 @@ void HandleAlerts() {
 // inbound command reads.
 //------------------------------------------------------------------------------
 
+// NOTE ON THE MISSING LINK CHECK.
+//
+// All three UDP senders used to open with `if (Ethernet.linkStatus() != LinkON)
+// return;`. On 2026-08-24 this machine sat with TCP working perfectly and every
+// UDP packet silently missing — tcpdump on the Pi caught nothing at all, while
+// the CSV stream and ARP were both fine. The TCP client has no such check, and
+// that gate was the only difference between the path that worked and the path
+// that did not: linkStatus() had stopped reporting LinkON after a link-down and
+// -up cycle, so every send was skipped before it was attempted.
+//
+// Refusing to send costs a packet either way, and the refusal is invisible:
+// udpSendFailCount cannot increment for a send that never happened, so the
+// symptom was telemetry that just stopped with nothing anywhere saying why.
+// Attempting it and counting the failure is the honest version — a genuinely
+// down link fails at endPacket() and shows up in the counter.
 void SendStatusUpdate() {
-    if (Ethernet.linkStatus() != LinkON) {
-        return;
-    }
     char telemetryBuffer[256];
     uint32_t uptimeMs = millis();
     uint32_t cmdAgeMs = uptimeMs - t.lastRxCmdMs;
@@ -1061,9 +1073,6 @@ void SendStatusUpdate() {
 // The Pi's parser reads cal_state by index and ignores the tail, so extra
 // diagnostic fields can be appended here without breaking it.
 void SendCalState() {
-    if (Ethernet.linkStatus() != LinkON) {
-        return;
-    }
     char buf[160];
     uint32_t beltSpeedX100 = (uint32_t)((calBeltInPerSec * 100.0f) + 0.5f);
 
@@ -1090,9 +1099,6 @@ void SendCalState() {
 // for full state at event time. eventCode must start with "FAULT_"; motor
 // attributes the fault ("roller").
 void SendEvent(const char *eventCode, const char *motor) {
-    if (Ethernet.linkStatus() != LinkON) {
-        return;
-    }
     char telemetryBuffer[128];
     uint32_t uptimeMs = millis();
     uint32_t seq = ++t.seq;
@@ -1136,9 +1142,26 @@ void setup() {
     ////////////////////////////////////////////////////////
 
     Ethernet.begin(mac, ip); // Set static IP
-    while (Ethernet.linkStatus() == LinkOFF) {
-        Serial.println("Waiting for Ethernet link...");
-        delay(1000);
+
+    // Wait for the link, but not forever. This is a point-to-point cable to the
+    // Pi, so if the Pi is off there IS no link partner and the original
+    // unbounded loop parked the whole controller in setup() until somebody
+    // powered the Pi on. Time out and carry on instead: MaintainEthernetLink()
+    // in loop() picks the link up whenever it appears, and everything that
+    // needs the network already checks linkStatus() before it sends.
+    {
+        const uint32_t LINK_WAIT_MS = 15000;
+        uint32_t waitStart = millis();
+        while (Ethernet.linkStatus() == LinkOFF &&
+               millis() - waitStart < LINK_WAIT_MS) {
+            Serial.println("Waiting for Ethernet link...");
+            delay(1000);
+        }
+        if (Ethernet.linkStatus() == LinkOFF) {
+            Serial.println("No Ethernet link at boot — continuing without it. "
+                           "The link will be picked up automatically if it "
+                           "appears.");
+        }
     }
 
     /////////////////////////////////////////////////////////
@@ -1191,7 +1214,49 @@ void setup() {
     ResetCalibration("boot");
 }
 
+// Bring the IP stack back after the physical link has been away.
+//
+// WHY THIS EXISTS. Ethernet.begin() used to run exactly once, in setup(). The
+// Pi is the only thing on the other end of this cable, so powering it off drops
+// this controller's carrier, and the stack goes down with it. When the Pi comes
+// back the PHY renegotiates — both ends show a live link — but the netif is
+// still down, so this controller silently ignores ARP and is invisible on the
+// LAN until someone power-cycles it. The Pi reports that as "No link" on the
+// calibration screen, which is true and completely unactionable.
+//
+// Re-running begin() on the rising edge of linkStatus() rebuilds the netif.
+// Udp.begin() has to be repeated too — its socket does not survive the netif
+// going down — and the TCP client is dropped so the existing reconnect path
+// below rebuilds it on its next attempt rather than sitting on a dead socket
+// it still believes is open.
+void MaintainEthernetLink() {
+    // Starts true because setup() has already brought the link up in the normal
+    // case; if it timed out waiting, the first pass here sees LinkOFF and this
+    // corrects itself on the next transition.
+    static bool lastLinkUp = true;
+
+    const bool linkUp = (Ethernet.linkStatus() == LinkON);
+
+    if (linkUp && !lastLinkUp) {
+        Serial.println("Ethernet link restored — reinitialising the IP stack.");
+        client.stop();
+        Ethernet.begin(mac, ip);
+        Udp.begin(UDP_LOCAL_PORT);
+        Serial.println("IP stack reinitialised; reconnecting to the server.");
+    } else if (!linkUp && lastLinkUp) {
+        Serial.println("Ethernet link lost — the Pi is probably powered down. "
+                       "Sequencing continues; telemetry resumes when it returns.");
+    }
+
+    lastLinkUp = linkUp;
+}
+
 void loop() {
+  // Recover from the Pi having been away long enough to drop the link. Must run
+  // before the reconnect block, which would otherwise keep retrying TCP over a
+  // netif that is still down.
+  MaintainEthernetLink();
+
   // Non-blocking reconnect: only attempt when the socket is actually down,
   // and rate-limit attempts so we don't stall the control loop.
   static unsigned long lastReconnectAttempt = 0;

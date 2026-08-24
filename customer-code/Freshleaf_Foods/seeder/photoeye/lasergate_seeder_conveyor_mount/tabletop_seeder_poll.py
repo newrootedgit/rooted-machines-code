@@ -118,6 +118,29 @@ SHUTDOWN_TEXT_FAILED = "HALT FAILED"
 # somehow survived cannot re-trigger a shutdown on the next start.
 SHUTDOWN_REQUEST_PATH = "/run/rooted/shutdown-request"
 
+# The per-value settings screens, each carrying one number on var 1, mapped to
+# the field it edits. Poll repaints each one from the stored preset when the
+# operator arrives on it — see the loop — so the number in front of them always
+# belongs to the variety selected on screen 10.
+#
+# Screen 17 also pushes all seven at once, and that is kept: it is what loads a
+# variety the operator is about to RUN. This map is what makes the values right
+# no matter how the operator got to the screen, including the paths that never
+# touch screen 17.
+#
+# Screen 3 (belt speed) is deliberately absent — it was removed from the TE menu
+# and the conveyor runs off the VFD dial.
+SETTINGS_SCREENS = {
+    6:  "roller_speed",
+    11: "irrigation_delay",
+    12: "irrigation_duration",
+    13: "misting_delay",
+    14: "misting_duration",
+    15: "roller_delay",
+    16: "roller_duration",
+}
+SETTINGS_VALUE_VAR = 1   # every settings screen holds its number on var 1
+
 # Calibration screen. The button writes 1 into CAL_TRIGGER_VAR the same way the
 # run screen's toggle does; poll relays it to the ClearCore as calibrate_request
 # in the JSON and renders the controller's reported cal_state back here.
@@ -837,6 +860,43 @@ def restore_vars_if_reset():
     set_variable(15, 1, v.get("roller_delay", 0))       # Roller Delay
     set_variable(16, 1, v.get("roller_duration", 0))    # Roller Duration
 
+def load_setting_for_screen(screen_id: int) -> bool:
+    """
+    Repaint one settings screen from the preset selected on screen 10.
+
+    Called on arrival, not every tick — otherwise poll would overwrite the
+    operator's keystrokes as they typed. The consequence is that leaving a
+    settings screen without saving through screen 9 discards the edit, which is
+    the honest behaviour: these screens claim to show what is stored, so an
+    unsaved number should not survive being navigated away from.
+
+    Note this reads the screen 10 selection rather than active_variety. The two
+    differ whenever the operator is browsing a variety they have not confirmed,
+    and the selection is the one they are looking at.
+    """
+    field = SETTINGS_SCREENS.get(screen_id)
+    if field is None:
+        return False
+
+    try:
+        sel = get_variable(VARIETY_NAME_SCREEN, 1)
+    except Exception as e:
+        print(f"settings s{screen_id}: could not read the screen 10 selection ({e}); "
+              f"leaving the displayed value alone")
+        return False
+
+    data = locked_read_json(JSON_FILE_PATH) or {}
+    preset = data.get(str(int(sel)))
+    if not isinstance(preset, dict):
+        # A slot with nothing in it shows zero rather than the last variety's
+        # number, which would otherwise read as "this variety is configured".
+        print(f"settings s{screen_id}: variety {sel} has no stored preset; showing 0")
+        return set_variable(screen_id, SETTINGS_VALUE_VAR, 0)
+
+    value = preset.get(field, 0)
+    print(f"settings s{screen_id}: variety {sel} {field} = {value}")
+    return set_variable(screen_id, SETTINGS_VALUE_VAR, value)
+
 def handle_disconnect_and_recover():
     """Apply chosen recovery strategy on disconnect."""
     if RECOVERY_MODE == "restart":
@@ -866,8 +926,14 @@ def monitor_touch_encoder_loop():
     except Exception as e:
         print(f"Error setting initial screen 10: {e}")
 
-    # Track the last index we wrote a name for, so we only push on change
+    # The last index AND the last name string we wrote to screen 10. Both are
+    # needed: the index alone would miss a rename, which now arrives at any
+    # moment from the web app rather than only when the operator scrolls.
     last_shown_index = None
+    last_shown_name = None
+
+    # Same idea for the run screen's variety name.
+    last_run_name = None
 
     # Per-screen display caches — only push to encoder when the text changes,
     # and each doubles as the "just entered that screen" signal (None == not on
@@ -875,6 +941,10 @@ def monitor_touch_encoder_loop():
     # 18 <-> 19 directly still re-runs the stale-press guard on arrival.
     last_state_status = None
     last_cal_text = None
+
+    # Which settings screen we repainted last, so the repaint happens once on
+    # arrival instead of every tick. None means "not on one last time round".
+    last_settings_screen = None
 
     # When the outstanding calibration request was raised, for the ack timeout.
     cal_request_raised_at = None
@@ -989,16 +1059,30 @@ def monitor_touch_encoder_loop():
         # (screen 10 / var 1). Mirror that selection to the name string (var 7).
         if active_screen == ScreenID(VARIETY_NAME_SCREEN):
             sel = get_variable(VARIETY_NAME_SCREEN, 1)
-            if sel is not None and sel != last_shown_index:
-                # Only cache the index once the name is actually on the screen.
-                # The te library throws an occasional "list index out of range"
-                # on string writes; caching regardless would leave the operator
-                # looking at the previous variety's name until they scrolled
-                # somewhere else and back, with nothing on screen saying so.
-                if write_variety_to_screen(sel):
-                    last_shown_index = sel
+            if sel is not None:
+                # Compare the NAME as well as the index. The web app can rename
+                # a variety at any time over MQTT, and on a machine parked on
+                # screen 10 the index never changes — so an index-only check
+                # would leave the old name on the encoder indefinitely, which
+                # reads as a rename that did not take.
+                name = get_variety_name(sel)
+                if sel != last_shown_index or name != last_shown_name:
+                    # Only cache once the name is actually on the screen. The te
+                    # library throws an occasional "list index out of range" on
+                    # string writes; caching regardless would leave the operator
+                    # looking at the previous variety's name until they scrolled
+                    # somewhere else and back, with nothing on screen saying so.
+                    if write_variety_to_screen(sel):
+                        last_shown_index = sel
+                        last_shown_name = name
         else:
             last_shown_index = None
+            last_shown_name = None
+
+        # Leaving a settings screen re-arms the repaint, so coming back to one
+        # picks up a selection that changed while the operator was away.
+        if int(active_screen) not in SETTINGS_SCREENS:
+            last_settings_screen = None
 
         # -----------------------------
         # Screen 9: Save Confirmation
@@ -1091,6 +1175,8 @@ def monitor_touch_encoder_loop():
             first_entry = last_state_status is None
             if first_entry:
                 set_variable(STATE_SCREEN, STATE_BTN_PRESS_VAR, 0)
+                # Force the name to repaint on arrival as well as on change.
+                last_run_name = None
 
             # ready_to_run in the JSON is the single source of truth — not the
             # encoder. Deriving the text from it (rather than flipping whatever
@@ -1098,6 +1184,18 @@ def monitor_touch_encoder_loop():
             # after a poll restart, a TE reconnect, or a change made elsewhere.
             data = locked_read_json(JSON_FILE_PATH) or {}
             running = bool(data.get("ready_to_run", False))
+
+            # The run screen names the variety the machine is loaded with, so a
+            # rename has to reach it too — otherwise the operator renames a
+            # variety, walks to the screen that says what is running, and finds
+            # the old name still there.
+            run_variety = data.get("active_variety")
+            if run_variety is not None:
+                names = data.get("variety_names") or {}
+                run_name = str(names.get(str(run_variety), run_variety))
+                if run_name != last_run_name:
+                    if set_string_var(RUNNING_VARIETY_SCREEN, RUNNING_VARIETY_VAR, run_name):
+                        last_run_name = run_name
 
             status_text = STATUS_TEXT_RUNNING if running else STATUS_TEXT_STOPPED
             if status_text != last_state_status:
@@ -1127,6 +1225,21 @@ def monitor_touch_encoder_loop():
                 # Consume the press so the latch is re-armed. Without this the
                 # var stays 1 and the machine would toggle every poll cycle.
                 set_variable(STATE_SCREEN, STATE_BTN_PRESS_VAR, 0)
+
+        # ---------------------------------------------
+        # Screens 6, 11-16: per-value settings
+        # ---------------------------------------------
+        # Repaint from the stored preset the moment the operator opens one, so
+        # the number in front of them is the selected variety's rather than
+        # whatever the last loaded variety left behind. Before this, the values
+        # were only pushed by screen 17 and by restore_vars_if_reset, so any
+        # route to a settings screen that skipped both showed the previous
+        # variety's numbers — which reads as a preset that failed to save.
+        elif int(active_screen) in SETTINGS_SCREENS:
+            scr = int(active_screen)
+            if last_settings_screen != scr:
+                last_settings_screen = scr
+                load_setting_for_screen(scr)
 
         # ---------------------------------------------
         # Screen 19: Calibration (status text + calibrate button)
