@@ -299,6 +299,11 @@ int user_vfd_speed = 1;
 // fresh press — the operator has to release and press again.
 bool prevCalibrateRequest = true;
 
+// Whether we have already tried to adopt the Pi's stored belt speed. Set on the
+// first CSV parsed after boot, restore or not, so a later operator-requested
+// recalibration is never undone by the next heartbeat. See parseReceivedMessage().
+bool calRestoreAttempted = false;
+
 // Fallback belt speed (inches/sec) by VFD dial setting, used ONLY until the
 // first successful calibration. Once calibrated, the measured speed supersedes
 // this entirely. Expressing the fallback as a SPEED rather than as a delay is
@@ -788,6 +793,7 @@ void parseReceivedMessage(char *message) {
     int active_variety_int = 0;
     int vfd_speed_val = 1;
     int calibrate_request_int = 0;
+    long saved_belt_speed_x100 = 0;
     float roller_speed_val = 0;
     char variety_name_buf[33] = "";
 
@@ -798,7 +804,7 @@ void parseReceivedMessage(char *message) {
     int trim_on_units[CH_COUNT]  = { 0, 0, 0 };
     int trim_off_units[CH_COUNT] = { 0, 0, 0 };
 
-    while (token != NULL && fieldIndex < 12) {
+    while (token != NULL && fieldIndex < 13) {
         switch (fieldIndex) {
             case 0: // ready_to_run
                 ready_to_run_int = atoi(token);
@@ -833,7 +839,11 @@ void parseReceivedMessage(char *message) {
             case 10: // calibrate_request — operator pressed Calibrate on the TE
                 calibrate_request_int = atoi(token);
                 break;
-            case 11: // variety_name (last field; bounded copy)
+            case 11: // calibrated_belt_speed_x100 — last measurement, kept by
+                     // the Pi across our power cycles. 0 = never calibrated.
+                saved_belt_speed_x100 = atol(token);
+                break;
+            case 12: // variety_name (last field; bounded copy)
                 strncpy(variety_name_buf, token, sizeof(variety_name_buf) - 1);
                 variety_name_buf[sizeof(variety_name_buf) - 1] = '\0';
                 // Defensive: scrub anything that would break our CSV/UDP framing.
@@ -885,6 +895,42 @@ void parseReceivedMessage(char *message) {
         ResetCalibration("operator requested");
     }
     prevCalibrateRequest = (calibrate_request_int != 0);
+
+    // Restore the last measured belt speed the Pi kept for us.
+    //
+    // This board has no persistent storage, so a power cycle would otherwise
+    // throw away a perfectly good measurement and burn the next tray as a
+    // no-dispense calibration pass. The Pi holds the value; this adopts it.
+    //
+    // ONCE PER BOOT, and the guard is the whole design. The obvious version —
+    // "restore whenever calState is CAL_WAITING" — silently defeats the
+    // Calibrate button: ResetCalibration() puts us back to CAL_WAITING, and the
+    // very next heartbeat, a second later, would restore the old value and
+    // report CAL_DONE again. The operator would press Calibrate and watch
+    // nothing happen. Attempting exactly once, on the first CSV we ever parse,
+    // means every later ResetCalibration() sticks.
+    //
+    // The flag is set whether or not a value was there to restore, so a machine
+    // that boots before its first calibration does not keep retrying.
+    if (!calRestoreAttempted) {
+        calRestoreAttempted = true;
+        if (saved_belt_speed_x100 > 0) {
+            calBeltInPerSec = (float)saved_belt_speed_x100 / 100.0f;
+            calState        = CAL_DONE;
+            RefreshChannelDelays();
+
+            // Say plainly that this was not measured this power cycle. The
+            // stored speed is only true for the tray it was measured with —
+            // TRAY_LENGTH_IN is what converts dwell to speed — so a tray change
+            // makes it quietly wrong, and nothing here can detect that.
+            Serial.println("=== Belt speed RESTORED from Pi (not measured this boot) ===");
+            Serial.print("  belt speed:  "); Serial.print(calBeltInPerSec);
+            Serial.println(" in/s");
+            Serial.print("  assumes tray length "); Serial.print(TRAY_LENGTH_IN);
+            Serial.println(" in — press Calibrate if the tray has changed.");
+            Serial.println("=== Normal sequencing active ===");
+        }
+    }
 
     // Rescale hopper RPM (same logic you already had)
     user_hopper_rpm *= 10;
