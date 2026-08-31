@@ -201,6 +201,93 @@ bool HopperMoveVelocity(int velocity) {
     return true;
 }
 
+// Shortest roller run worth commanding. The motor has to decelerate and
+// re-accelerate under AccelMax, so a pulse below this is not a real dispense
+// however the arithmetic works out.
+static const float ROLLER_MIN_ON_MS = 250.0f;
+
+// Absolute ceiling on either edge. Belt-and-suspenders against a nonsensical
+// belt_speed or distance edit; no real sequence approaches it.
+static const float SEQUENCE_MAX_MS = 30000.0f;
+
+// Hold the operator's roller window inside what the machine can actually do.
+//
+// WHY CLAMP RATHER THAN REJECT. Whether a given trim is achievable depends on
+// belt speed and tray length, and the HMI knows neither — it cannot validate
+// these at entry. Rejecting here would leave the operator with a saved value
+// that silently does nothing, which is worse than railing: railing behaves like
+// every other physical control, where you keep turning and reach the stop.
+//
+// Before this, roller_duration at the bottom of its range computed an end time
+// before the start time, and the roller simply never ran — no error, no output,
+// nothing to distinguish it from a broken motor.
+//
+// Rules in order. Later rules may move an edge an earlier one already moved, so
+// the minimum-run rule is applied LAST and always holds; it is allowed to push
+// the end past SEQUENCE_MAX_MS, because a real run matters more than an
+// arbitrary ceiling.
+void ClampRollerWindow(float &startMs, float &endMs,
+                       float irrigationStartMs, float mistingStartMs) {
+    const float askedStart = startMs;
+    const float askedEnd   = endMs;
+    const char *startRule  = 0;
+    const char *endRule    = 0;
+
+    // 1. Nothing happens before the tray trips the photoeye.
+    if (startMs < 0.0f) { startMs = 0.0f; startRule = "cannot start before the tray trips the photoeye"; }
+    if (endMs   < 0.0f) { endMs   = 0.0f; endRule   = "cannot stop before the tray trips the photoeye"; }
+
+    // 2. Ceiling.
+    if (startMs > SEQUENCE_MAX_MS) { startMs = SEQUENCE_MAX_MS; startRule = "above the sequence ceiling"; }
+    if (endMs   > SEQUENCE_MAX_MS) { endMs   = SEQUENCE_MAX_MS; endRule   = "above the sequence ceiling"; }
+
+    // 3. Keep the physical order: irrigation, then roller, then misting. The
+    //    three sit at fixed distances and a tray reaches them in that order, so
+    //    a roller start outside that window describes something the machine
+    //    cannot do.
+    if (startMs < irrigationStartMs) { startMs = irrigationStartMs; startRule = "would start before irrigation"; }
+    if (startMs > mistingStartMs)    { startMs = mistingStartMs;    startRule = "would start after misting"; }
+
+    // 4. A run the motor can actually perform. Last, so it always holds.
+    if (endMs < startMs + ROLLER_MIN_ON_MS) {
+        endMs   = startMs + ROLLER_MIN_ON_MS;
+        endRule = "run shorter than the motor minimum";
+    }
+
+    // Report only on change. This runs every pass of the main loop, so an
+    // unconditional print would bury the log — but a silent clamp repeats the
+    // failure this exists to fix, where a control appears to work and does not.
+    static bool  haveLast = false;
+    static float lastStart = 0.0f, lastEnd = 0.0f;
+    static const char *lastStartRule = 0, *lastEndRule = 0;
+
+    if (!haveLast || startMs != lastStart || endMs != lastEnd ||
+        startRule != lastStartRule || endRule != lastEndRule) {
+        if (startRule) {
+            Serial.print("CLAMPED roller START: asked ");
+            Serial.print(askedStart, 0); Serial.print(" ms -> ");
+            Serial.print(startMs, 0);    Serial.print(" ms (");
+            Serial.print(startRule);     Serial.println(")");
+        }
+        if (endRule) {
+            Serial.print("CLAMPED roller STOP: asked ");
+            Serial.print(askedEnd, 0); Serial.print(" ms -> ");
+            Serial.print(endMs, 0);    Serial.print(" ms (");
+            Serial.print(endRule);     Serial.println(")");
+        }
+        if (!startRule && !endRule && haveLast) {
+            Serial.print("Roller window now as dialled: ");
+            Serial.print(startMs, 0); Serial.print(" .. ");
+            Serial.print(endMs, 0);   Serial.println(" ms");
+        }
+        haveLast      = true;
+        lastStart     = startMs;
+        lastEnd       = endMs;
+        lastStartRule = startRule;
+        lastEndRule   = endRule;
+    }
+}
+
 void parseReceivedMessage(char *message) {
     // Expected CSV format (11 fields):
     // ready_to_run,active_variety,roller_speed,belt_speed,
@@ -692,6 +779,13 @@ void loop() {
       irrigation_end_time = (distance_irrigation_end / belt_speed) * 1000 + user_irrigation_end_mod_value*100;
       roller_end_time     = (distance_roller_end     / belt_speed) * 1000 + user_roller_end_mod_value*100;
       misting_end_time    = (distance_misting_end    / belt_speed) * 1000 + user_misting_end_mod_value*100;
+
+      // Only the roller pair is operator-adjustable on this machine —
+      // irrigation and misting are pinned at zero offset in the settings file's
+      // fixed_timings block — so only that pair can be driven somewhere the
+      // machine cannot go.
+      ClampRollerWindow(roller_start_time, roller_end_time,
+                        irrigation_start_time, misting_start_time);
   }
 
   ////////////////////////////////////////////////////////////
