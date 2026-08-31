@@ -630,10 +630,35 @@ void loop() {
   // needs, and silently rescales the whole sequence. There is nothing to
   // correct here; there is only a number to measure.
   //
-  // TO MEASURE: set belt speed to 10, press Start, mark the belt and time it
-  // over a known distance. Divide the result by 10 and put it here. Check at 5
-  // and 20 as well — if it is not linear this wants a lookup table.
-  float BELT_M_PER_S_PER_UNIT = 0.0085f; // matches the previous code's scale
+  // MEASURED 2026-08-24, replacing the 0.0085f inherited from the previous
+  // code's scale factor. Time to travel 10 inches, several runs per setting:
+  //
+  //     setting  runs  mean s   in/s
+  //        20      6    1.112   8.996
+  //        18      6    1.192   8.392
+  //        16      6    1.383   7.229
+  //        14      5    1.580   6.329
+  //        12      5    1.874   5.336
+  //        10      5    2.200   4.545
+  //         5      3    4.440   2.252
+  //
+  // Least squares through the origin gives 0.45396 in/s per unit, R^2 = 0.998,
+  // worst residual 2.6% — inside the run-to-run scatter, which is +-5.8% at
+  // setting 20. Linear, so the single constant the old comment asked for is the
+  // right shape and no lookup table is needed. Through the origin because
+  // setting 0 is a stopped belt; the free intercept came out at -0.06 in/s,
+  // which is noise, not an offset.
+  //
+  //     0.45396 in/s per unit * 0.0254 m/in = 0.011531 m/s per unit
+  //
+  // The old 0.0085 was 26% low, so every travel time it produced was ~36% too
+  // long and every actuator fired late. Any trim tuned against it was partly
+  // compensating for that — re-tune the offsets from zero rather than adjusting
+  // the numbers that are in there now.
+  //
+  // TO RE-MEASURE: mark the belt, time it over a known distance at several
+  // settings, fit in/s against setting through the origin, multiply by 0.0254.
+  float BELT_M_PER_S_PER_UNIT = 0.011531f; // measured, see above
 
   // The constant above is m/s per unit of the OPERATOR'S SETTING (0-20), but
   // user_belt_rpm is that setting already multiplied by 500 at parse time — it
