@@ -36,18 +36,19 @@ unsigned char packetReceived[MAX_PACKET_LENGTH];
 EthernetClient client;
 
 bool ready_to_run_flag = false;   // =0 at power-up / reset
-bool sequenceActive = false;
-unsigned long startTime = 0;
+
 /////////////////////////////////////////////////////////////////////////////
 ///////// User Sequence Modification Values and Motor Speeds ////////////////
 /////////////////////////////////////////////////////////////////////////////
-
-float irrigation_start_time;
-float irrigation_end_time;
-float roller_start_time;
-float roller_end_time;
-float misting_start_time;
-float misting_end_time;
+//
+// sequenceActive, startTime and the six absolute *_start_time / *_end_time
+// globals are gone. They belonged to the single-sequence state machine, which
+// could only track one tray at a time; the delay lines carry per-edge
+// timestamps instead, so several sheets can be in the machine at once.
+//
+// The six mod values below survive unchanged — they are the operator's trim,
+// and they now shift each channel's ON and OFF edge independently. See
+// ComputeChannelDelays().
 
 float user_irrigation_start_mod_value = 0;
 float user_roller_start_mod_value = 0;
@@ -101,46 +102,182 @@ TelemetryState t;
 
 
 ////////////////////////////////////////////////////////////
-////////////// Define sequence geometry ////////////////////
+////////// Actuator geometry and delay lines ///////////////
 ////////////////////////////////////////////////////////////
+//
+// ARCHITECTURE — read this before touching the timing.
+//
+// Each actuator sits a fixed distance downstream of the photoeye, so the belt
+// takes travel_i to carry any given point from the gate to that actuator. Each
+// output therefore replays what the beam saw, delayed by exactly that:
+//
+//     output_i(t) = gate_state(t - travel_i)
+//
+// implemented as a per-channel FIFO of gate edges, each stamped with the time
+// it happened AT THE GATE. Every edge is pushed to all three channels at once
+// and each channel releases it on its own schedule.
+//
+// This REPLACED a single-sequence state machine that started on a photoeye
+// rising edge and ran absolute timings from it. That design could not do two
+// things this machine needs:
+//
+//   1. BACK-TO-BACK SHEETS. Only one sequence could be live, and a sequence did
+//      not end until the tray had cleared misting — so the next sheet had to be
+//      15.04 in behind (exactly the gate->misting distance) or it was dropped,
+//      silently and untreated, at every belt speed. Here overlap is the normal
+//      case: sheet two's ON edge queues while sheet one's OFF edges are still
+//      draining, so irrigation can be treating one sheet while misting finishes
+//      the one before it. Required spacing is zero.
+//
+//   2. PUNNET SHEETS. A tray is a moulded sheet of punnets, so the beam breaks
+//      and clears several times per sheet. The old roller-start gate sampled
+//      the beam at ONE instant and latched; when that instant fell in a gap the
+//      roller was suppressed for the entire sheet. Gaps are now absorbed at the
+//      actuator by CHANNEL_MIN_OFF_MS, AFTER the delay, so they never reach the
+//      trigger logic and impose no spacing requirement of their own. Nothing
+//      here needs to know the punnet pitch or count.
+//
+// Consequence worth knowing: stop times now come from the sheet's real trailing
+// edge, not from an assumed tray length. A wrong tray_length can no longer make
+// an actuator cut off early or late.
 
-// ############ MEASURE THIS ############
-// tray_length is still the value from the reference machine. It sets when each
-// actuator STOPS (below) and the tray-block sanity check in the photoeye
-// handler, so a wrong value shows up as actuators cutting off early or late and
-// as trays being rejected as too short. Measure the actual tray and set it.
-float tray_length = 0.5302; // meters — NOT YET MEASURED ON THIS MACHINE
+enum {
+    CH_IRRIGATION = 0,
+    CH_ROLLER     = 1,   // seed roller / hopper motor
+    CH_MISTING    = 2,
+    CH_COUNT      = 3
+};
+
+static const char * const CHANNEL_NAME[CH_COUNT] = {
+    "irrigation", "roller", "misting"
+};
 
 // refarm Dubai, measured from the CENTRE of the laser gate along belt travel.
-// These are true distances in metres and can be checked with a tape measure —
-// which only holds while belt_speed stays dimensionally correct (see the
-// 2*pi note further down). Rescale one and you must rescale the other.
-float distance_irrigation_start = 0.125817;  //  4.953424 in — first solenoid
-float distance_roller_start     = 0.248485;  //  9.782867 in — roller
-float distance_misting_start    = 0.382054;  // 15.041477 in — final solenoid
+// True distances in metres, checkable with a tape measure.
+static const float CHANNEL_DISTANCE_M[CH_COUNT] = {
+    0.125817f,  //  4.953424 in — first solenoid
+    0.248485f,  //  9.782867 in — roller
+    0.382054f,  // 15.041477 in — final solenoid
+};
 
-// Each actuator runs until the tray's trailing edge has passed it, so the stop
-// distance is the start distance plus one tray length.
+// Shortest OFF window worth actuating, per channel. This is what makes punnet
+// sheets work: if two blocked spans are separated by less than this, the
+// actuator is held ON straight through rather than chattering. A solenoid has a
+// finite pull-in and drop-out time so a shorter pulse is not physically real,
+// and the roller would have to decelerate and re-accelerate under AccelMax.
 //
-// The reference machine carried +0.01 and -0.06 nudges here, and the sequence
-// timings carried "- N*motor_rps" terms alongside them. Both were bench-tuned
-// against that machine AND against the old 6.28x-wrong belt_speed, so neither
-// means anything here. Starting clean: geometry only, then tune on a real tray
-// using the roller offsets on screens 16 and 40.
-float distance_irrigation_end = distance_irrigation_start + tray_length;
-float distance_roller_end     = distance_roller_start     + tray_length;
-float distance_misting_end    = distance_misting_start    + tray_length;
+// It also sets the boundary between "gap between punnets" (bridge it) and "gap
+// between sheets" (a real OFF). At belt setting 15 a 0.42 in punnet gap is
+// ~61 ms, far under the roller's 250 ms, while two separate sheets are an
+// unambiguous OFF at any spacing the infeed can produce.
+static const uint32_t CHANNEL_MIN_OFF_MS[CH_COUNT] = {
+    120,  // CH_IRRIGATION
+    250,  // CH_ROLLER — motor: stopping and restarting is the most expensive
+    120,  // CH_MISTING
+};
 
+// Shortest ON pulse worth producing, per channel. The floor the operator's stop
+// trim is clamped against: a pulse is dwell + (travelOff - travelOn), so a stop
+// trim more negative than the sheet's own dwell would close the actuator before
+// it opened.
+static const uint32_t CHANNEL_MIN_ON_MS[CH_COUNT] = {
+    120,  // CH_IRRIGATION
+    250,  // CH_ROLLER
+    120,  // CH_MISTING
+};
 
+// Length of one sheet along travel. NO LONGER sets when anything stops — the
+// real trailing edge does that. Its only remaining job is to say how long a
+// sheet holds the beam, which is the budget a negative stop trim is measured
+// against in ComputeChannelDelays().
+float tray_length = 0.34925; // 13.75 in — moulded punnet sheet, whole string
 
-void printSequenceTimes(float irrigation_start, float roller_start, float misting_start, float irrigation_end,  float roller_end,  float misting_end) {
-    DBG_PRINTLN("Time Sequence Debug Values:");
-    DBG_PRINT("Irrigation Start: "); DBG_PRINTLN(irrigation_start);
-    DBG_PRINT("Roller Start: ");     DBG_PRINTLN(roller_start);
-    DBG_PRINT("Misting Start: ");    DBG_PRINTLN(misting_start);
-    DBG_PRINT("Irrigation End: ");   DBG_PRINTLN(irrigation_end);
-    DBG_PRINT("Roller End: ");       DBG_PRINTLN(roller_end);
-    DBG_PRINT("Misting End: ");      DBG_PRINTLN(misting_end);
+// Absolute ceiling on any derived travel time. Belt-and-suspenders against a
+// nonsensical belt_speed or distance edit; no real sequence approaches it.
+static const float TRAVEL_MAX_MS = 30000.0f;
+
+/////////////////////////////////////////////////////////////////////////////
+/////////////////////// Gate -> Actuator delay lines ////////////////////////
+/////////////////////////////////////////////////////////////////////////////
+
+struct GateEvent {
+    uint32_t atMs;     // millis() when this edge occurred at the gate
+    bool     blocked;  // gate state AFTER the edge (true = beam broken)
+};
+
+// 16 edges is 8 on/off pairs in flight at once. A punnet sheet pushes one pair
+// per punnet, so this holds two full sheets of four in the worst case plus the
+// spacing between them — comfortably more than the 15 in between the gate and
+// the farthest actuator can physically contain.
+static const uint8_t GATE_FIFO_LEN = 16;
+
+struct DelayLine {
+    GateEvent fifo[GATE_FIFO_LEN];
+    uint8_t   head;
+    uint8_t   tail;
+    uint8_t   count;
+    uint32_t  drops;        // edges lost to overflow; should stay 0
+    // The two edges are held for different durations: that difference is what
+    // lengthens or shortens the pulse relative to the sheet's own dwell, and is
+    // where the operator's start/stop trim lands.
+    uint32_t  travelOnMs;   // gate rising  -> actuator ON
+    uint32_t  travelOffMs;  // gate falling -> actuator OFF
+    bool      headState;    // delayed gate state as seen by this actuator
+};
+
+DelayLine channels[CH_COUNT];
+
+void DelayLinePush(DelayLine &d, uint32_t atMs, bool blocked) {
+    if (d.count >= GATE_FIFO_LEN) {
+        d.drops++;   // never expected; surfaced in telemetry rather than hidden
+        return;
+    }
+    d.fifo[d.tail].atMs    = atMs;
+    d.fifo[d.tail].blocked = blocked;
+    d.tail  = (uint8_t)((d.tail + 1) % GATE_FIFO_LEN);
+    d.count++;
+}
+
+void DelayLinePop(DelayLine &d) {
+    if (d.count == 0) return;
+    d.head = (uint8_t)((d.head + 1) % GATE_FIFO_LEN);
+    d.count--;
+}
+
+// Release whatever has aged past this channel's own travel time, absorbing any
+// OFF window too short to be worth actuating.
+void DelayLineAdvance(int ch, uint32_t nowMs) {
+    DelayLine     &d        = channels[ch];
+    const uint32_t minOffMs = CHANNEL_MIN_OFF_MS[ch];
+
+    while (d.count > 0) {
+        const bool     edgeBlocked = d.fifo[d.head].blocked;
+        const uint32_t edgeAtMs    = d.fifo[d.head].atMs;
+
+        // ON edges wait travelOnMs, OFF edges travelOffMs. The queue stays
+        // strictly in order, so an OFF can never overtake the ON it belongs to
+        // even when travelOffMs is the smaller of the two — it just becomes due
+        // immediately after, which would be a zero-length pulse. That is what
+        // CHANNEL_MIN_ON_MS prevents in ComputeChannelDelays().
+        const uint32_t dueAfterMs = edgeBlocked ? d.travelOnMs : d.travelOffMs;
+        if ((nowMs - edgeAtMs) < dueAfterMs) break;
+
+        // Peek ahead: is this an OFF window too short to be worth actuating —
+        // i.e. a gap between punnets rather than the end of a sheet?
+        if (!edgeBlocked && d.count >= 2) {
+            const uint8_t nextIdx = (uint8_t)((d.head + 1) % GATE_FIFO_LEN);
+            if (d.fifo[nextIdx].blocked &&
+                (d.fifo[nextIdx].atMs - edgeAtMs) < minOffMs) {
+                // Swallow both edges — hold ON straight through the gap.
+                DelayLinePop(d);
+                DelayLinePop(d);
+                continue;
+            }
+        }
+
+        d.headState = edgeBlocked;
+        DelayLinePop(d);
+    }
 }
 
 bool BeltMoveVelocity(int velocity) {
@@ -201,90 +338,227 @@ bool HopperMoveVelocity(int velocity) {
     return true;
 }
 
-// Shortest roller run worth commanding. The motor has to decelerate and
-// re-accelerate under AccelMax, so a pulse below this is not a real dispense
-// however the arithmetic works out.
-static const float ROLLER_MIN_ON_MS = 250.0f;
+////////////////////////////////////////////////////////////
+/////////////// Belt speed and channel timing //////////////
+////////////////////////////////////////////////////////////
 
-// Absolute ceiling on either edge. Belt-and-suspenders against a nonsensical
-// belt_speed or distance edit; no real sequence approaches it.
-static const float SEQUENCE_MAX_MS = 30000.0f;
+// Belt travel in metres per second per unit of the operator's belt speed
+// setting (screen 3, range 0-20). Measured on this machine: time to travel
+// 10 inches, 3-6 runs at each of seven settings from 5 to 20, least squares
+// through the origin. 0.45396 in/s per unit, R^2 = 0.998.
+static const float BELT_M_PER_S_PER_UNIT = 0.011531f;
 
-// Hold the operator's roller window inside what the machine can actually do.
+// user_belt_rpm is the operator setting already multiplied by 500 at parse time
+// — a pulse rate, not the setting — so the 500 comes back out here.
+float currentBeltSpeed() {
+    return (user_belt_rpm / 500.0f) * BELT_M_PER_S_PER_UNIT;
+}
+
+bool beltSpeedValid() {
+    return currentBeltSpeed() > 0.01f;
+}
+
+// How long one sheet holds the beam at the current belt speed. This is the
+// budget a negative stop trim is measured against: a pulse is dwell +
+// (travelOff - travelOn), so a stop trim more negative than the dwell would
+// close the actuator before it opened.
+uint32_t expectedDwellMs() {
+    float v = currentBeltSpeed();
+    if (v < 0.001f) v = 0.001f;
+    return (uint32_t)((tray_length / v) * 1000.0f + 0.5f);
+}
+
+// Pure geometry: gate -> actuator, BEFORE the operator's trim.
+uint32_t channelTravelMs(int ch) {
+    float v = currentBeltSpeed();
+    if (v < 0.001f) v = 0.001f;
+    float ms = (CHANNEL_DISTANCE_M[ch] / v) * 1000.0f;
+    if (ms > TRAVEL_MAX_MS) ms = TRAVEL_MAX_MS;
+    return (uint32_t)(ms + 0.5f);
+}
+
+// Why an edge ended up somewhere other than base + trim. Recorded per edge so
+// the operator is told which control was overruled and by which rule, rather
+// than a blanket "something was clamped" covering all six numbers.
 //
-// WHY CLAMP RATHER THAN REJECT. Whether a given trim is achievable depends on
-// belt speed and tray length, and the HMI knows neither — it cannot validate
-// these at entry. Rejecting here would leave the operator with a saved value
-// that silently does nothing, which is worse than railing: railing behaves like
-// every other physical control, where you keep turning and reach the stop.
+// Rules are applied in order and a later one can move an edge an earlier one
+// already moved, so this records the LAST rule to change it — the one actually
+// holding the value where it is.
+enum ClampReason {
+    CLAMP_NONE = 0,
+    CLAMP_NEGATIVE,   // rule 1
+    CLAMP_ORDER,      // rule 2
+    CLAMP_MIN_ON,     // rule 3
+    CLAMP_CEILING,    // rule 4
+};
+
+const char *ClampReasonText(uint8_t reason) {
+    switch (reason) {
+        case CLAMP_NEGATIVE: return "cannot act before the gate edge that triggered it";
+        case CLAMP_ORDER:    return "would fire out of physical sequence";
+        case CLAMP_MIN_ON:   return "pulse shorter than this channel's minimum";
+        case CLAMP_CEILING:  return "beyond the travel-time ceiling";
+        default:             return "";
+    }
+}
+
+// Apply the operator's trim to the geometric base and clamp the result into
+// what the machine can physically do.
 //
-// Before this, roller_duration at the bottom of its range computed an end time
-// before the start time, and the roller simply never ran — no error, no output,
-// nothing to distinguish it from a broken motor.
+// WHY CLAMP RATHER THAN REJECT. Whether a trim is achievable depends on belt
+// speed and sheet length, and the HMI knows neither — it cannot validate these
+// at entry. Rejecting here would leave the operator with a saved value that
+// silently does nothing, which is the failure this exists to remove. Railing
+// behaves like every other physical control: keep turning and you reach the
+// stop, and the caller says so.
 //
-// Rules in order. Later rules may move an edge an earlier one already moved, so
-// the minimum-run rule is applied LAST and always holds; it is allowed to push
-// the end past SEQUENCE_MAX_MS, because a real run matters more than an
-// arbitrary ceiling.
-void ClampRollerWindow(float &startMs, float &endMs,
-                       float irrigationStartMs, float mistingStartMs) {
-    const float askedStart = startMs;
-    const float askedEnd   = endMs;
-    const char *startRule  = 0;
-    const char *endRule    = 0;
+// Plain arrays rather than a struct out-param on purpose: the Arduino build
+// inserts generated prototypes above the first function definition in the file,
+// so a user type named in a signature has to be declared before that point.
+// Builtin types sidestep the ordering entirely.
+//
+// The four rules, in order. Each is applied AFTER the previous so a later rule
+// cannot reintroduce a violation of an earlier one:
+//
+//   1. No delay is negative. The earliest anything can happen is the instant
+//      the gate edge occurs; we cannot act before the sheet we are reacting to.
+//   2. The physical order holds: irrigation, then roller, then misting. They
+//      sit at 4.95, 9.78 and 15.04 in and a sheet reaches them in that order.
+//   3. Every pulse stays at least CHANNEL_MIN_ON_MS long, measured against the
+//      dwell. This is the rule that catches "stop trim longer than the sheet".
+//   4. Nothing exceeds TRAVEL_MAX_MS.
+//
+// NOTE there is deliberately no "must start while the sheet is still over the
+// photoeye" rule. That was needed only by the old roller-start gate, which
+// sampled the beam once and latched. Nothing samples the beam now — each edge
+// carries its own timestamp through the FIFO — so a trim that pushes an
+// actuator past the trailing edge simply produces a later pulse, which is what
+// the operator asked for.
+bool ComputeChannelDelays(uint32_t outOn[], uint32_t outOff[],
+                          int32_t askedOn[], int32_t askedOff[],
+                          uint8_t reasonOn[], uint8_t reasonOff[]) {
+    const int64_t dwell = (int64_t)expectedDwellMs();
+    bool clamped = false;
 
-    // 1. Nothing happens before the tray trips the photoeye.
-    if (startMs < 0.0f) { startMs = 0.0f; startRule = "cannot start before the tray trips the photoeye"; }
-    if (endMs   < 0.0f) { endMs   = 0.0f; endRule   = "cannot stop before the tray trips the photoeye"; }
+    const float trimOnMs[CH_COUNT] = {
+        user_irrigation_start_mod_value * 100.0f,
+        user_roller_start_mod_value     * 100.0f,
+        user_misting_start_mod_value    * 100.0f,
+    };
+    const float trimOffMs[CH_COUNT] = {
+        user_irrigation_end_mod_value * 100.0f,
+        user_roller_end_mod_value     * 100.0f,
+        user_misting_end_mod_value    * 100.0f,
+    };
 
-    // 2. Ceiling.
-    if (startMs > SEQUENCE_MAX_MS) { startMs = SEQUENCE_MAX_MS; startRule = "above the sequence ceiling"; }
-    if (endMs   > SEQUENCE_MAX_MS) { endMs   = SEQUENCE_MAX_MS; endRule   = "above the sequence ceiling"; }
+    int64_t on[CH_COUNT], off[CH_COUNT];
 
-    // 3. Keep the physical order: irrigation, then roller, then misting. The
-    //    three sit at fixed distances and a tray reaches them in that order, so
-    //    a roller start outside that window describes something the machine
-    //    cannot do.
-    if (startMs < irrigationStartMs) { startMs = irrigationStartMs; startRule = "would start before irrigation"; }
-    if (startMs > mistingStartMs)    { startMs = mistingStartMs;    startRule = "would start after misting"; }
+    for (int ch = 0; ch < CH_COUNT; ch++) {
+        const int64_t base = (int64_t)channelTravelMs(ch);
+        on[ch]  = base + (int64_t)trimOnMs[ch];
+        off[ch] = base + (int64_t)trimOffMs[ch];
 
-    // 4. A run the motor can actually perform. Last, so it always holds.
-    if (endMs < startMs + ROLLER_MIN_ON_MS) {
-        endMs   = startMs + ROLLER_MIN_ON_MS;
-        endRule = "run shorter than the motor minimum";
+        askedOn[ch]   = (int32_t)on[ch];
+        askedOff[ch]  = (int32_t)off[ch];
+        reasonOn[ch]  = CLAMP_NONE;
+        reasonOff[ch] = CLAMP_NONE;
+
+        // Rule 1 — nothing before the edge that caused it.
+        if (on[ch]  < 0) { on[ch]  = 0; reasonOn[ch]  = CLAMP_NEGATIVE; clamped = true; }
+        if (off[ch] < 0) { off[ch] = 0; reasonOff[ch] = CLAMP_NEGATIVE; clamped = true; }
     }
 
-    // Report only on change. This runs every pass of the main loop, so an
-    // unconditional print would bury the log — but a silent clamp repeats the
-    // failure this exists to fix, where a control appears to work and does not.
-    static bool  haveLast = false;
-    static float lastStart = 0.0f, lastEnd = 0.0f;
-    static const char *lastStartRule = 0, *lastEndRule = 0;
+    // Rule 2 — keep the physical sequence. Raise a later channel to its
+    // predecessor rather than lowering the earlier one, so a trim can always
+    // delay a stage but never drag the stage ahead of it backwards.
+    for (int ch = 1; ch < CH_COUNT; ch++) {
+        if (on[ch]  < on[ch - 1])  { on[ch]  = on[ch - 1];  reasonOn[ch]  = CLAMP_ORDER; clamped = true; }
+        if (off[ch] < off[ch - 1]) { off[ch] = off[ch - 1]; reasonOff[ch] = CLAMP_ORDER; clamped = true; }
+    }
 
-    if (!haveLast || startMs != lastStart || endMs != lastEnd ||
-        startRule != lastStartRule || endRule != lastEndRule) {
-        if (startRule) {
-            Serial.print("CLAMPED roller START: asked ");
-            Serial.print(askedStart, 0); Serial.print(" ms -> ");
-            Serial.print(startMs, 0);    Serial.print(" ms (");
-            Serial.print(startRule);     Serial.println(")");
+    for (int ch = 0; ch < CH_COUNT; ch++) {
+        // Rule 3 — a real pulse. Length is dwell + (off - on), so the floor on
+        // off is on - dwell + minimum. Applied after rule 2 because raising an
+        // ON edge there shortens that channel's pulse.
+        const int64_t minOff = on[ch] - dwell + (int64_t)CHANNEL_MIN_ON_MS[ch];
+        if (off[ch] < minOff) { off[ch] = minOff; reasonOff[ch] = CLAMP_MIN_ON;  clamped = true; }
+        if (off[ch] < 0)      { off[ch] = 0;      reasonOff[ch] = CLAMP_NEGATIVE; clamped = true; }
+
+        // Rule 4 — absolute ceiling.
+        if (on[ch]  > (int64_t)TRAVEL_MAX_MS) { on[ch]  = (int64_t)TRAVEL_MAX_MS; reasonOn[ch]  = CLAMP_CEILING; clamped = true; }
+        if (off[ch] > (int64_t)TRAVEL_MAX_MS) { off[ch] = (int64_t)TRAVEL_MAX_MS; reasonOff[ch] = CLAMP_CEILING; clamped = true; }
+
+        outOn[ch]  = (uint32_t)on[ch];
+        outOff[ch] = (uint32_t)off[ch];
+    }
+
+    return clamped;
+}
+
+// Recompute both edges for every channel and store them on the delay lines.
+//
+// Reports only when the numbers change. This runs every pass of the main loop,
+// so an unconditional print would bury the log; but a silent clamp repeats the
+// failure this exists to fix, where a control appears to work and does not.
+void RefreshChannelDelays() {
+    static bool     haveLast = false;
+    static uint32_t lastOn[CH_COUNT], lastOff[CH_COUNT];
+    static uint8_t  lastReasonOn[CH_COUNT]  = { CLAMP_NONE, CLAMP_NONE, CLAMP_NONE };
+    static uint8_t  lastReasonOff[CH_COUNT] = { CLAMP_NONE, CLAMP_NONE, CLAMP_NONE };
+
+    uint32_t on[CH_COUNT], off[CH_COUNT];
+    int32_t  askedOn[CH_COUNT], askedOff[CH_COUNT];
+    uint8_t  reasonOn[CH_COUNT], reasonOff[CH_COUNT];
+    const bool clamped = ComputeChannelDelays(on, off, askedOn, askedOff,
+                                              reasonOn, reasonOff);
+
+    bool changed = !haveLast;
+    for (int ch = 0; ch < CH_COUNT && !changed; ch++) {
+        if (on[ch] != lastOn[ch] || off[ch] != lastOff[ch])   changed = true;
+        if (reasonOn[ch]  != lastReasonOn[ch])                changed = true;
+        if (reasonOff[ch] != lastReasonOff[ch])               changed = true;
+    }
+
+    for (int ch = 0; ch < CH_COUNT; ch++) {
+        channels[ch].travelOnMs  = on[ch];
+        channels[ch].travelOffMs = off[ch];
+        lastOn[ch]        = on[ch];
+        lastOff[ch]       = off[ch];
+        lastReasonOn[ch]  = reasonOn[ch];
+        lastReasonOff[ch] = reasonOff[ch];
+    }
+    haveLast = true;
+
+    if (changed) {
+        Serial.print("Channel timing (sheet dwell ");
+        Serial.print(expectedDwellMs());
+        Serial.println(" ms):");
+        for (int ch = 0; ch < CH_COUNT; ch++) {
+            Serial.print("  ");
+            Serial.print(CHANNEL_NAME[ch]);
+            Serial.print(": base ");    Serial.print(channelTravelMs(ch));
+            Serial.print(" ms -> on "); Serial.print(on[ch]);
+            Serial.print(" ms, off ");  Serial.print(off[ch]);
+            Serial.println(" ms");
         }
-        if (endRule) {
-            Serial.print("CLAMPED roller STOP: asked ");
-            Serial.print(askedEnd, 0); Serial.print(" ms -> ");
-            Serial.print(endMs, 0);    Serial.print(" ms (");
-            Serial.print(endRule);     Serial.println(")");
+        if (clamped) {
+            for (int ch = 0; ch < CH_COUNT; ch++) {
+                if (reasonOn[ch] != CLAMP_NONE) {
+                    Serial.print("  CLAMPED ");   Serial.print(CHANNEL_NAME[ch]);
+                    Serial.print(" ON: asked ");  Serial.print(askedOn[ch]);
+                    Serial.print(" ms -> ");      Serial.print(on[ch]);
+                    Serial.print(" ms (");        Serial.print(ClampReasonText(reasonOn[ch]));
+                    Serial.println(")");
+                }
+                if (reasonOff[ch] != CLAMP_NONE) {
+                    Serial.print("  CLAMPED ");   Serial.print(CHANNEL_NAME[ch]);
+                    Serial.print(" OFF: asked "); Serial.print(askedOff[ch]);
+                    Serial.print(" ms -> ");      Serial.print(off[ch]);
+                    Serial.print(" ms (");        Serial.print(ClampReasonText(reasonOff[ch]));
+                    Serial.println(")");
+                }
+            }
         }
-        if (!startRule && !endRule && haveLast) {
-            Serial.print("Roller window now as dialled: ");
-            Serial.print(startMs, 0); Serial.print(" .. ");
-            Serial.print(endMs, 0);   Serial.println(" ms");
-        }
-        haveLast      = true;
-        lastStart     = startMs;
-        lastEnd       = endMs;
-        lastStartRule = startRule;
-        lastEndRule   = endRule;
     }
 }
 
@@ -690,235 +964,92 @@ void loop() {
   }
 
   ////////////////////////////////////////////////////////////
-  //////////////// Calculate Motor Speed //////////////////////
+  //////////////// Gate sampling and dispatch /////////////////
   ////////////////////////////////////////////////////////////
-
-  // Belt travel in metres per second per unit of the operator's belt speed
-  // setting (screen 3, range 0-20).
   //
-  // This is the SAME SCALE the previous code produced, collapsed into one
-  // number. That code read:
-  //
-  //     motor_rps  = user_belt_rpm / 60          // user_belt_rpm already *= 500
-  //     belt_speed = motor_rps * 0.1 * 0.0102    // "gear ratio", "pulley radius"
-  //
-  // user_belt_rpm is a PULSE RATE, not rpm: it is scaled by 500 at parse time
-  // and handed to BeltMotor.MoveVelocity() as pulses/sec. So the /60 and the
-  // pulley terms are not a physical model of the drivetrain — together they are
-  // an empirical scale factor, and it lands in the right place:
-  //
-  //     (setting * 500 / 60) * 0.1 * 0.0102  =  setting * 0.0085 m/s
-  //
-  // At a belt setting of 10 that is 0.085 m/s, which matches the machine.
-  //
-  // Kept as ONE constant rather than the old expression because the old form
-  // looks like physics and invites correction — someone measures the pulley,
-  // fixes the radius, or adds the 2*pi that a real rev-to-travel conversion
-  // needs, and silently rescales the whole sequence. There is nothing to
-  // correct here; there is only a number to measure.
-  //
-  // MEASURED 2026-08-24, replacing the 0.0085f inherited from the previous
-  // code's scale factor. Time to travel 10 inches, several runs per setting:
-  //
-  //     setting  runs  mean s   in/s
-  //        20      6    1.112   8.996
-  //        18      6    1.192   8.392
-  //        16      6    1.383   7.229
-  //        14      5    1.580   6.329
-  //        12      5    1.874   5.336
-  //        10      5    2.200   4.545
-  //         5      3    4.440   2.252
-  //
-  // Least squares through the origin gives 0.45396 in/s per unit, R^2 = 0.998,
-  // worst residual 2.6% — inside the run-to-run scatter, which is +-5.8% at
-  // setting 20. Linear, so the single constant the old comment asked for is the
-  // right shape and no lookup table is needed. Through the origin because
-  // setting 0 is a stopped belt; the free intercept came out at -0.06 in/s,
-  // which is noise, not an offset.
-  //
-  //     0.45396 in/s per unit * 0.0254 m/in = 0.011531 m/s per unit
-  //
-  // The old 0.0085 was 26% low, so every travel time it produced was ~36% too
-  // long and every actuator fired late. Any trim tuned against it was partly
-  // compensating for that — re-tune the offsets from zero rather than adjusting
-  // the numbers that are in there now.
-  //
-  // TO RE-MEASURE: mark the belt, time it over a known distance at several
-  // settings, fit in/s against setting through the origin, multiply by 0.0254.
-  float BELT_M_PER_S_PER_UNIT = 0.011531f; // measured, see above
+  // Everything below is edge-driven. There is no sequence state, no "currently
+  // processing a tray" flag, and nothing samples the beam at a chosen instant.
+  // Each gate edge is timestamped once, pushed to all three channels, and each
+  // channel releases it after its own travel time. That is what lets sheets run
+  // back to back: two sheets simply put more edges in the queues.
 
-  // The constant above is m/s per unit of the OPERATOR'S SETTING (0-20), but
-  // user_belt_rpm is that setting already multiplied by 500 at parse time — it
-  // is a pulse rate, not the setting. So the 500 has to come back out here.
-  // The old expression consumed it implicitly via `motor_rps = user_belt_rpm /
-  // 60`; collapsing the expression dropped that step, which made belt_speed
-  // 500x too fast and squeezed the whole sequence into ~21 ms — shorter than
-  // one pass of this loop, so the roller was commanded on and off inside a
-  // single tick and never spun up.
-  float belt_setting = user_belt_rpm / 500.0f;
-  float belt_speed = belt_setting * BELT_M_PER_S_PER_UNIT;
+  RefreshChannelDelays();
 
-  ////////////////////////////////////////////////////////////
-  ////////// Calculate Default Sequence Times ////////////////
-  ////////////////////////////////////////////////////////////
+  const uint32_t nowMs = millis();
 
-  float irrigation_start_time = 0, roller_start_time = 0, misting_start_time = 0;
-  float irrigation_end_time = 0, roller_end_time = 0, misting_end_time = 0;
-  bool belt_speed_valid = (belt_speed > 0.01f);
-  if (belt_speed_valid) {
-      // The "- N*motor_rps" correction terms that used to sit on four of these
-      // lines are gone. They were bench fudges from the reference machine,
-      // dimensionally meaningless (rev/s subtracted from milliseconds), and
-      // tuned against the old 6.28x-wrong belt_speed. Carrying another
-      // machine's magic numbers into a fresh commissioning would make every
-      // discrepancy impossible to attribute.
-      irrigation_start_time = (distance_irrigation_start / belt_speed) * 1000 + user_irrigation_start_mod_value*100;
-      roller_start_time     = (distance_roller_start     / belt_speed) * 1000 + user_roller_start_mod_value*100;
-      misting_start_time    = (distance_misting_start    / belt_speed) * 1000 + user_misting_start_mod_value*100;
+  // Polarity normalized at the single point the pin is read. TRUE means the
+  // beam is broken. Punnet gaps are NOT filtered here — they are absorbed per
+  // channel in DelayLineAdvance() by CHANNEL_MIN_OFF_MS, after the delay, which
+  // is what keeps them from imposing any spacing requirement between sheets.
+  const bool gateBlocked = (digitalRead(inputPin1) == PHOTOEYE_BLOCKED_LEVEL);
 
-      irrigation_end_time = (distance_irrigation_end / belt_speed) * 1000 + user_irrigation_end_mod_value*100;
-      roller_end_time     = (distance_roller_end     / belt_speed) * 1000 + user_roller_end_mod_value*100;
-      misting_end_time    = (distance_misting_end    / belt_speed) * 1000 + user_misting_end_mod_value*100;
-
-      // Only the roller pair is operator-adjustable on this machine —
-      // irrigation and misting are pinned at zero offset in the settings file's
-      // fixed_timings block — so only that pair can be driven somewhere the
-      // machine cannot go.
-      ClampRollerWindow(roller_start_time, roller_end_time,
-                        irrigation_start_time, misting_start_time);
-  }
-
-  ////////////////////////////////////////////////////////////
-  /////////////// Sequence Execution Logic ///////////////////
-  ////////////////////////////////////////////////////////////
-
-  // TRUE means a tray is blocking the beam. Polarity is normalized here, at the
-  // single point the pin is read, so every downstream test below — the start
-  // edge, the trailing-edge block measurement, the roller-start gate and the
-  // tray counter — reads as plain "tray present" regardless of how the sensor
-  // is wired. See PHOTOEYE_BLOCKED_LEVEL up top.
-  bool inputState = (digitalRead(inputPin1) == PHOTOEYE_BLOCKED_LEVEL);
-  static bool lastPhotoeyeState = false;
-
-  // Roller-start gate state (reset each sequence). The roller is committed once
-  // per sequence at roller-start and latched — see the roller block below.
-  static bool rollerGateEvaluated = false;
-  static bool rollerAllowed       = false;
-  // Set on the photoeye falling edge if the tray blocked the beam long enough
-  // to be a real tray (vs a noise/debris false trigger). Gates traysProcessed.
-  static bool trayBlockValid      = false;
-
-  // Rising-edge only: a tray that's still parked in front of the photoeye
-  // when the previous sequence ends must not immediately re-fire — wait for
-  // it to clear and a new tray to arrive. Refuse to start without a valid
-  // belt speed (clamped/zero speed produces nonsense timings).
-  if (inputState && !lastPhotoeyeState && !sequenceActive && ready_to_run_flag && belt_speed_valid) {
-      startTime = millis();
-      sequenceActive = true;
-      rollerGateEvaluated = false;
-      rollerAllowed       = false;
-      trayBlockValid      = false;
-      DBG_PRINTLN("Photoeye rising edge: Starting event sequence.");
-  }
-
-  // Falling edge: tray trailing edge has cleared the photoeye. Measure how long
-  // the beam was blocked and decide locally whether this was a real tray. We
-  // use the same belt_speed time-base the sequence timings use, so any scaling
-  // cancels. The lower bound is deliberately generous (MIN_TRAY_BLOCK_FRACTION
-  // of the expected full-tray block time) so smaller or larger trays still
-  // count — only brief noise/debris false triggers are rejected. This only
-  // gates the local traysProcessed counter; no new data is sent to the Pi.
-  //
-  // Scale the expected block time by any roller-duration extension the user
-  // dialed in: a longer roller duration implies a longer tray, which blocks the
-  // beam proportionally longer. user_roller_end_mod_value*100 is already in ms
-  // (same units as the timing math), so it adds directly. Only extend, never
-  // shorten, the expected window.
-  static const float MIN_TRAY_BLOCK_FRACTION = 0.3f;
-  if (!inputState && lastPhotoeyeState && sequenceActive && belt_speed_valid) {
-      unsigned long blockMs = millis() - startTime;
-      float rollerDurationExtraMs = user_roller_end_mod_value > 0.0f
-                                        ? user_roller_end_mod_value * 100.0f
-                                        : 0.0f;
-      float expectedBlockMs = (tray_length / belt_speed) * 1000.0f + rollerDurationExtraMs;
-      trayBlockValid = (expectedBlockMs > 0.0f) &&
-                       ((float)blockMs >= MIN_TRAY_BLOCK_FRACTION * expectedBlockMs);
-  }
-  lastPhotoeyeState = inputState;
-
-  if (sequenceActive) {
-      unsigned long elapsedTime = millis() - startTime;
-      unsigned long irrigationStartMs = irrigation_start_time;
-      unsigned long irrigationEndMs = irrigation_end_time;
-      unsigned long rollerStartMs = roller_start_time;
-      unsigned long rollerEndMs = roller_end_time;
-      unsigned long mistingStartMs = misting_start_time;
-      unsigned long mistingEndMs = misting_end_time;
-
-      // printSequenceTimes(irrigationStartMs, rollerStartMs, mistingStartMs, irrigationEndMs, rollerEndMs, mistingEndMs);
-
-      if (elapsedTime >= irrigationStartMs && elapsedTime < irrigationEndMs) {
-          digitalWrite(relay0Pin, HIGH);
-          // Serial.println("Irrigation ON");
-      } else if (elapsedTime >= irrigationEndMs) {
-          digitalWrite(relay0Pin, LOW);
-          // Serial.println("Irrigation OFF");
-      }
-
-      if (elapsedTime >= rollerStartMs && elapsedTime < rollerEndMs) {
-          // Roller-start gate: only commit the roller if the tray is STILL
-          // blocking the photoeye at roller-start. A real tray (~0.53 m) is
-          // much longer than the sensor->roller distance (0.127 m / 5 in on
-          // this machine), so it must still cover the beam here. If it doesn't, the rising edge was a
-          // false trigger (noise/debris/short object) and we suppress the
-          // roller for this sequence to avoid dispensing onto bare belt.
-          // Evaluate ONCE at roller-start, then latch — do NOT gate on live
-          // photoeye state, since a real tray legitimately clears the beam
-          // (~0.53 m) well before roller-end (~0.79 m).
-          if (!rollerGateEvaluated) {
-              rollerGateEvaluated = true;
-              rollerAllowed = inputState;
-              if (rollerAllowed) {
-                  // Accrue the deterministic run window once, here at commit.
-                  // The roller runs rollerStart..rollerEnd unconditionally from
-                  // this point, so this equals the actual run time.
-                  if (rollerEndMs > rollerStartMs) {
-                      t.hopperMotorUptimeMs += (uint32_t)(rollerEndMs - rollerStartMs);
-                  }
-              } else {
-                  DBG_PRINTLN("Roller suppressed: photoeye cleared before roller-start (likely false trigger).");
-              }
-          }
-          if (rollerAllowed) {
-              HopperMoveVelocity(user_hopper_rpm);  // Example values: 100 RPM
-          }
-
-      } else if (elapsedTime >= rollerEndMs) {
-          // Serial.println("Roller OFF");
-          HopperMoveVelocity(0);  // Example values: 100 RPM
-
-      }
-
-      if (elapsedTime >= mistingStartMs && elapsedTime < mistingEndMs) {
-          digitalWrite(relay1Pin, HIGH);
-          // Serial.println("Misting ON");
-      } else if (elapsedTime >= mistingEndMs) {
-          digitalWrite(relay1Pin, LOW);
-          // Serial.println("Misting OFF");
-      }
-
-      if (elapsedTime >= irrigationEndMs && elapsedTime >= rollerEndMs && elapsedTime >= mistingEndMs) {
-          sequenceActive = false;
-          // Only count real trays. Either the trailing edge cleared the beam
-          // long enough to validate (trayBlockValid), or the tray is still over
-          // the photoeye at sequence end (a tray longer than the sequence
-          // window) — both are real trays. A brief false trigger validates as
-          // neither and is not counted.
-          if (trayBlockValid || inputState) {
-              t.traysProcessed++;
+  static bool lastGateBlocked = false;
+  static bool haveGateState   = false;
+  if (!haveGateState) {
+      lastGateBlocked = gateBlocked;
+      haveGateState   = true;
+  } else if (gateBlocked != lastGateBlocked) {
+      // Queue the edge on every channel at once. Refuse while disarmed or
+      // without a usable belt speed: travel times would be meaningless, and an
+      // edge queued now would fire minutes later when the belt restarts.
+      if (ready_to_run_flag && beltSpeedValid()) {
+          for (int ch = 0; ch < CH_COUNT; ch++) {
+              DelayLinePush(channels[ch], nowMs, gateBlocked);
           }
       }
+      lastGateBlocked = gateBlocked;
   }
+
+  // Release whatever has aged past each channel's own travel time.
+  for (int ch = 0; ch < CH_COUNT; ch++) {
+      DelayLineAdvance(ch, nowMs);
+  }
+
+  // Disarmed: drop every output and discard queued edges, so re-arming does not
+  // replay a sheet that has long since left the machine.
+  if (!ready_to_run_flag) {
+      for (int ch = 0; ch < CH_COUNT; ch++) {
+          channels[ch].head = channels[ch].tail = channels[ch].count = 0;
+          channels[ch].headState = false;
+      }
+  }
+
+  ////////////////////////////////////////////////////////////
+  //////////////////// Drive the actuators ////////////////////
+  ////////////////////////////////////////////////////////////
+
+  // Solenoids are level devices: write them unconditionally every pass.
+  digitalWrite(relay0Pin, channels[CH_IRRIGATION].headState ? HIGH : LOW);
+  digitalWrite(relay1Pin, channels[CH_MISTING].headState    ? HIGH : LOW);
+
+  // The roller is a motor, not a valve, so it is edge-driven off its own
+  // channel rather than commanded every pass.
+  {
+      static bool     rollerRunning = false;
+      static uint32_t rollerOnAtMs  = 0;
+      const bool rollerWanted = channels[CH_ROLLER].headState;
+
+      if (rollerWanted && !rollerRunning) {
+          HopperMoveVelocity(user_hopper_rpm);
+          rollerRunning = true;
+          rollerOnAtMs  = nowMs;
+
+          // One roller ON transition == one sheet. The punnet gaps have already
+          // been swallowed by CHANNEL_MIN_OFF_MS, so this counts sheets rather
+          // than punnets without needing to know how many punnets a sheet has.
+          t.traysProcessed++;
+          DBG_PRINTLN("Sheet at roller: ON.");
+      } else if (!rollerWanted && rollerRunning) {
+          HopperMoveVelocity(0);
+          rollerRunning = false;
+          if (rollerOnAtMs) {
+              t.hopperMotorUptimeMs += nowMs - rollerOnAtMs;
+              rollerOnAtMs = 0;
+          }
+          DBG_PRINTLN("Sheet past roller: OFF.");
+      }
+  }
+
 
   // Periodic telemetry — fire-and-forget, time-guarded so a slow socket
   // surfaces as a warning instead of silently skewing the motion loop.
