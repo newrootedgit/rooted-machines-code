@@ -119,14 +119,15 @@ SHUTDOWN_TEXT_FAILED = "HALT FAILED"
 SHUTDOWN_REQUEST_PATH = "/run/rooted/shutdown-request"
 
 # The per-value settings screens, each carrying one number on var 1, mapped to
-# the field it edits. Poll repaints each one from the stored preset when the
-# operator arrives on it — see the loop — so the number in front of them always
-# belongs to the variety selected on screen 10.
+# the field it edits. Screen 17 pushes all seven from the stored preset in one
+# pass and that is the ONLY routine load — see the loop.
 #
-# Screen 17 also pushes all seven at once, and that is kept: it is what loads a
-# variety the operator is about to RUN. This map is what makes the values right
-# no matter how the operator got to the screen, including the paths that never
-# touch screen 17.
+# Poll used to also repaint each screen on arrival, which meant scrolling from
+# one settings screen to the next re-read the stored preset and wiped whatever
+# the operator had just dialled in. Editing two values in one sitting was
+# therefore impossible: the second screen's repaint reverted the first. The
+# values are now loaded once, at selection time, and left alone until the
+# operator saves through screen 9.
 #
 # Screen 3 (belt speed) is deliberately absent — it was removed from the TE menu
 # and the conveyor runs off the VFD dial.
@@ -860,42 +861,17 @@ def restore_vars_if_reset():
     set_variable(15, 1, v.get("roller_delay", 0))       # Roller Delay
     set_variable(16, 1, v.get("roller_duration", 0))    # Roller Duration
 
-def load_setting_for_screen(screen_id: int) -> bool:
+def load_preset_onto_settings_screens(preset: Dict) -> None:
     """
-    Repaint one settings screen from the preset selected on screen 10.
+    Push a stored preset onto all seven settings screens in one pass.
 
-    Called on arrival, not every tick — otherwise poll would overwrite the
-    operator's keystrokes as they typed. The consequence is that leaving a
-    settings screen without saving through screen 9 discards the edit, which is
-    the honest behaviour: these screens claim to show what is stored, so an
-    unsaved number should not survive being navigated away from.
-
-    Note this reads the screen 10 selection rather than active_variety. The two
-    differ whenever the operator is browsing a variety they have not confirmed,
-    and the selection is the one they are looking at.
+    This is the only routine load, and it runs at selection time on screen 17.
+    Once these values are on the encoder the operator owns them: poll does not
+    write them again, so they can walk the settings screens in any order,
+    change as many as they like, and save the lot through screen 9.
     """
-    field = SETTINGS_SCREENS.get(screen_id)
-    if field is None:
-        return False
-
-    try:
-        sel = get_variable(VARIETY_NAME_SCREEN, 1)
-    except Exception as e:
-        print(f"settings s{screen_id}: could not read the screen 10 selection ({e}); "
-              f"leaving the displayed value alone")
-        return False
-
-    data = locked_read_json(JSON_FILE_PATH) or {}
-    preset = data.get(str(int(sel)))
-    if not isinstance(preset, dict):
-        # A slot with nothing in it shows zero rather than the last variety's
-        # number, which would otherwise read as "this variety is configured".
-        print(f"settings s{screen_id}: variety {sel} has no stored preset; showing 0")
-        return set_variable(screen_id, SETTINGS_VALUE_VAR, 0)
-
-    value = preset.get(field, 0)
-    print(f"settings s{screen_id}: variety {sel} {field} = {value}")
-    return set_variable(screen_id, SETTINGS_VALUE_VAR, value)
+    for screen_id, field in SETTINGS_SCREENS.items():
+        set_variable(screen_id, SETTINGS_VALUE_VAR, preset.get(field, 0))
 
 def handle_disconnect_and_recover():
     """Apply chosen recovery strategy on disconnect."""
@@ -941,10 +917,6 @@ def monitor_touch_encoder_loop():
     # 18 <-> 19 directly still re-runs the stale-press guard on arrival.
     last_state_status = None
     last_cal_text = None
-
-    # Which settings screen we repainted last, so the repaint happens once on
-    # arrival instead of every tick. None means "not on one last time round".
-    last_settings_screen = None
 
     # When the outstanding calibration request was raised, for the ack timeout.
     cal_request_raised_at = None
@@ -1079,11 +1051,6 @@ def monitor_touch_encoder_loop():
             last_shown_index = None
             last_shown_name = None
 
-        # Leaving a settings screen re-arms the repaint, so coming back to one
-        # picks up a selection that changed while the operator was away.
-        if int(active_screen) not in SETTINGS_SCREENS:
-            last_settings_screen = None
-
         # -----------------------------
         # Screen 9: Save Confirmation
         # -----------------------------
@@ -1128,40 +1095,35 @@ def monitor_touch_encoder_loop():
         elif active_screen == ScreenID(17):
             variety_index = get_variable(10, 1)
 
-            # Show the user feedback FIRST: push the name onto the running screen
-            # and navigate there immediately. The value loads below take ~8
-            # set_var round-trips, so doing the visual confirmation up front
-            # makes the selection feel instant.
-            write_variety_to_screen(
-                variety_index, RUNNING_VARIETY_SCREEN, RUNNING_VARIETY_VAR
-            )
-            try:
-                te.guide.set_screen(ScreenID(RUNNING_VARIETY_SCREEN))
-            except Exception as e:
-                print(f"Error setting screen {RUNNING_VARIETY_SCREEN}: {e}")
-
             save_active_variety(variety_index)  # Save active variety to JSON
             saved_data = load_variety_data()
 
+            # Name the running screen before we get there, so navigating to it
+            # never flashes the previous variety's name.
+            write_variety_to_screen(
+                variety_index, RUNNING_VARIETY_SCREEN, RUNNING_VARIETY_VAR
+            )
+
             key = str(variety_index)
             if key in saved_data and isinstance(saved_data[key], dict):
-                saved_values = saved_data[key]
-
-                # Push saved values into the encoder (done after navigation
-                # so the user already sees the new screen).
-                set_variable(6, 1, saved_values.get("roller_speed", 0))        # Roller Speed
-                # Screen 3 (Belt Speed) was removed from the TE menu — not pushed.
-                set_variable(11, 1, saved_values.get("irrigation_delay", 0))   # Irrigation Delay
-                set_variable(12, 1, saved_values.get("irrigation_duration", 0))# Irrigation Duration
-                set_variable(13, 1, saved_values.get("misting_delay", 0))      # Misting Delay
-                set_variable(14, 1, saved_values.get("misting_duration", 0))   # Misting Duration
-                set_variable(15, 1, saved_values.get("roller_delay", 0))       # Roller Delay
-                set_variable(16, 1, saved_values.get("roller_duration", 0))    # Roller Duration
+                # Load BEFORE navigating away. These are seven set_var
+                # round-trips and they used to run after the jump to the running
+                # screen, which left a window where an operator who dived
+                # straight into the settings screens watched the numbers change
+                # under them mid-edit. Finishing the load while screen 17 is
+                # still up costs a couple of seconds on the confirmation screen
+                # and makes the values settled by the time anyone can reach them.
+                load_preset_onto_settings_screens(saved_data[key])
 
                 # Now it's safe to run
                 ready_to_run_toggle(True)
             else:
                 print(f"Variety {variety_index} not found. Waiting for user to define it.")
+
+            try:
+                te.guide.set_screen(ScreenID(RUNNING_VARIETY_SCREEN))
+            except Exception as e:
+                print(f"Error setting screen {RUNNING_VARIETY_SCREEN}: {e}")
 
         # ---------------------------------------------
         # Screen 18: Run screen (variety name + Active/Paused + toggle button)
@@ -1229,17 +1191,11 @@ def monitor_touch_encoder_loop():
         # ---------------------------------------------
         # Screens 6, 11-16: per-value settings
         # ---------------------------------------------
-        # Repaint from the stored preset the moment the operator opens one, so
-        # the number in front of them is the selected variety's rather than
-        # whatever the last loaded variety left behind. Before this, the values
-        # were only pushed by screen 17 and by restore_vars_if_reset, so any
-        # route to a settings screen that skipped both showed the previous
-        # variety's numbers — which reads as a preset that failed to save.
-        elif int(active_screen) in SETTINGS_SCREENS:
-            scr = int(active_screen)
-            if last_settings_screen != scr:
-                last_settings_screen = scr
-                load_setting_for_screen(scr)
+        # Settings screens (6, 11-16) are deliberately NOT handled here. Poll
+        # loads them once from screen 17 and then keeps its hands off, so an
+        # operator can move between them and change several values before
+        # saving. Repainting on arrival, as this used to do, meant every hop
+        # between settings screens reverted the edit made on the last one.
 
         # ---------------------------------------------
         # Screen 19: Calibration (status text + calibrate button)

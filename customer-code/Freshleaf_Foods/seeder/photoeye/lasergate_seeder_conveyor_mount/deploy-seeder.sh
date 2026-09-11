@@ -85,7 +85,22 @@ for f in $FILES; do
 done
 rm -rf __pycache__
 
-LOCAL_SUMS="$(sha256sum $FILES)"
+# macOS has `shasum` and no `sha256sum`; Linux and Git Bash have the reverse.
+# Both print "<hash>  <name>" with two spaces, so whichever we pick here can be
+# compared directly against the Pi's `sha256sum` output below. Without this the
+# deploy died on macOS at "sha256sum: command not found" — after the compile
+# check and before the copy, so nothing shipped and the failure looked like a
+# problem with the files rather than with the laptop.
+if command -v sha256sum >/dev/null 2>&1; then
+    sha256_local() { sha256sum "$@"; }
+elif command -v shasum >/dev/null 2>&1; then
+    sha256_local() { shasum -a 256 "$@"; }
+else
+    err "no sha256sum or shasum found locally — cannot verify the deploy"
+    exit 1
+fi
+
+LOCAL_SUMS="$(sha256_local $FILES)"
 
 # ---------------------------------------------------------------------------
 # 2. Copy, then force it to the card
