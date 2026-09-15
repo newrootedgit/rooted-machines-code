@@ -85,7 +85,16 @@ for f in $FILES; do
 done
 rm -rf __pycache__
 
-LOCAL_SUMS="$(sha256sum $FILES)"
+# macOS ships `shasum -a 256`, not GNU `sha256sum`. Only the LOCAL side needs
+# this - the Pi is Linux and always has sha256sum. Output format is identical,
+# so the byte-for-byte comparison below is unaffected.
+if command -v sha256sum >/dev/null 2>&1; then
+    _sha256() { sha256sum "$@"; }
+else
+    _sha256() { shasum -a 256 "$@"; }
+fi
+
+LOCAL_SUMS="$(_sha256 $FILES)"
 
 # ---------------------------------------------------------------------------
 # 2. Copy, then force it to the card
